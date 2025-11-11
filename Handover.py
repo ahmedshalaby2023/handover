@@ -15,6 +15,13 @@ try:  # Plotly is optional; degrade gracefully if unavailable
 except ImportError:  # pragma: no cover - visual enhancement only
     px = None  # type: ignore[assignment]
 
+try:  # Prefer xlsxwriter for richer formatting, otherwise fall back
+    import xlsxwriter  # type: ignore  # noqa: F401
+
+    EXCEL_ENGINE = "xlsxwriter"
+except ImportError:  # pragma: no cover - platform dependent
+    EXCEL_ENGINE = "openpyxl"
+
 
 DB_PATH = Path(__file__).with_name("handover_tracker.db")
 STATUS_OPTIONS = ["Not Started", "In Progress", "Waiting", "Completed", "Archived"]
@@ -74,21 +81,22 @@ def build_excel_report(df: pd.DataFrame) -> bytes:
     )
 
     buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+    with pd.ExcelWriter(buffer, engine=EXCEL_ENGINE) as writer:
         export_df.to_excel(writer, index=False, sheet_name="Handover Register")
-        workbook = writer.book
-        worksheet = writer.sheets["Handover Register"]
+        if EXCEL_ENGINE == "xlsxwriter":
+            workbook = writer.book
+            worksheet = writer.sheets["Handover Register"]
 
-        header_format = workbook.add_format(
-            {"bold": True, "bg_color": "#003366", "font_color": "#FFFFFF", "align": "center"}
-        )
-        for col_num, value in enumerate(export_df.columns):
-            worksheet.write(0, col_num, value, header_format)
-            column_width = max(15, int(export_df[value].astype(str).str.len().max()) + 2)
-            worksheet.set_column(col_num, col_num, min(column_width, 60))
+            header_format = workbook.add_format(
+                {"bold": True, "bg_color": "#003366", "font_color": "#FFFFFF", "align": "center"}
+            )
+            for col_num, value in enumerate(export_df.columns):
+                worksheet.write(0, col_num, value, header_format)
+                column_width = max(15, int(export_df[value].astype(str).str.len().max()) + 2)
+                worksheet.set_column(col_num, col_num, min(column_width, 60))
 
-        date_format = workbook.add_format({"num_format": "dd mmm yyyy"})
-        worksheet.set_column("C:C", 18, date_format)
+            date_format = workbook.add_format({"num_format": "dd mmm yyyy"})
+            worksheet.set_column("C:C", 18, date_format)
 
     buffer.seek(0)
     return buffer.read()
