@@ -170,7 +170,7 @@ def build_graphviz_workflow(steps_df: pd.DataFrame) -> Optional[str]:
     lines: List[str] = [
         "digraph Workflow {",
         "    rankdir=LR;",
-        '    graph [splines=true, nodesep=0.8, ranksep=1.1];',
+        '    graph [splines=ortho, nodesep=0.8, ranksep=1.1];',
         '    node [shape=rectangle, style="rounded,filled", fontname="Helvetica", fontsize=22, fillcolor="#F7FAFC", color="#4A5568", fontcolor="#1A202C", fixedsize=false];',
         '    edge [fontname="Helvetica", fontsize=22, color="#4A5568"];',
     ]
@@ -187,6 +187,7 @@ def build_graphviz_workflow(steps_df: pd.DataFrame) -> Optional[str]:
     node_count = 0
     existing_nodes: Dict[int, str] = {}
     order_to_node: Dict[int, str] = {}
+    step_order_map: Dict[int, int] = {}
 
     for row in ordered.itertuples():
         if pd.isna(row.step_id):
@@ -205,8 +206,10 @@ def build_graphviz_workflow(steps_df: pd.DataFrame) -> Optional[str]:
             f'    {node_name} [label="{label}", shape={shape}, color="{border_color}", penwidth=2, fontsize=22, width={width:.2f}];'
         )
 
+        step_order_val = int(row.step_order)
         existing_nodes[step_id] = node_name
-        order_to_node[int(row.step_order)] = node_name
+        order_to_node[step_order_val] = node_name
+        step_order_map[step_id] = step_order_val
 
         if first_step_id is None:
             first_step_id = step_id
@@ -249,6 +252,7 @@ def build_graphviz_workflow(steps_df: pd.DataFrame) -> Optional[str]:
         def edge(target_raw: Optional[object], label_text: Optional[str]) -> None:
             target_name: Optional[str] = None
             target_key: Optional[int] = None
+            target_order: Optional[int] = None
             if target_raw is not None and not pd.isna(target_raw):
                 try:
                     target_key = int(target_raw)
@@ -257,8 +261,12 @@ def build_graphviz_workflow(steps_df: pd.DataFrame) -> Optional[str]:
 
             if target_key is not None:
                 target_name = existing_nodes.get(target_key)
+                if target_name is not None:
+                    target_order = step_order_map.get(target_key)
                 if target_name is None:
                     target_name = order_to_node.get(target_key)
+                    if target_name is not None:
+                        target_order = target_key
 
             signature = (target_name, label_text)
             if signature in outgoing_edges:
@@ -276,6 +284,8 @@ def build_graphviz_workflow(steps_df: pd.DataFrame) -> Optional[str]:
                     attrs.append('color="#C53030"')
                     attrs.append('fontcolor="#C53030"')
                     attrs.append('style="dotted"')
+            if target_order is not None and target_order < int(row.step_order):
+                attrs.append('constraint=false')
             if target_name is None:
                 attr_part = f" [ {' ,'.join(attrs)} ]".replace(" [  ]", "") if attrs else ""
                 lines.append(f'    {current} -> finish{attr_part};')
