@@ -8,8 +8,12 @@ from urllib.parse import quote
 from typing import Dict, Iterable, Optional
 
 import pandas as pd
-import plotly.express as px
 import streamlit as st
+
+try:  # Plotly is optional; degrade gracefully if unavailable
+    import plotly.express as px  # type: ignore
+except ImportError:  # pragma: no cover - visual enhancement only
+    px = None  # type: ignore[assignment]
 
 
 DB_PATH = Path(__file__).with_name("handover_tracker.db")
@@ -360,36 +364,42 @@ def render_review() -> None:
 
     render_metrics(df)
 
-    status_summary = (
-        df.groupby("status")["id"].count().reset_index().rename(columns={"id": "count"})
-    )
-    status_summary["display"] = status_summary["status"].apply(status_badge)
+    if px is None:
+        st.warning(
+            "Plotly is not installed, so charts are hidden. Install `plotly` to see the visuals.",
+            icon="⚠️",
+        )
+    else:
+        status_summary = (
+            df.groupby("status")["id"].count().reset_index().rename(columns={"id": "count"})
+        )
+        status_summary["display"] = status_summary["status"].apply(status_badge)
 
-    pie_col, chart_col = st.columns([1, 2])
-    with pie_col:
-        fig = px.pie(
-            status_summary,
-            names="display",
-            values="count",
-            color="status",
-            color_discrete_map=STATUS_COLORS,
-            title="Status distribution",
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        pie_col, chart_col = st.columns([1, 2])
+        with pie_col:
+            fig = px.pie(
+                status_summary,
+                names="display",
+                values="count",
+                color="status",
+                color_discrete_map=STATUS_COLORS,
+                title="Status distribution",
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
-    with chart_col:
-        timeline = (
-            df.groupby("meeting_date")["id"].count().reset_index().rename(columns={"id": "Topics"})
-        )
-        fig_timeline = px.area(
-            timeline,
-            x="meeting_date",
-            y="Topics",
-            title="Upcoming handover timeline",
-            color_discrete_sequence=["#636EFA"],
-        )
-        fig_timeline.update_traces(mode="lines+markers", line_shape="hv")
-        st.plotly_chart(fig_timeline, use_container_width=True)
+        with chart_col:
+            timeline = (
+                df.groupby("meeting_date")["id"].count().reset_index().rename(columns={"id": "Topics"})
+            )
+            fig_timeline = px.area(
+                timeline,
+                x="meeting_date",
+                y="Topics",
+                title="Upcoming handover timeline",
+                color_discrete_sequence=["#636EFA"],
+            )
+            fig_timeline.update_traces(mode="lines+markers", line_shape="hv")
+            st.plotly_chart(fig_timeline, use_container_width=True)
 
     st.markdown("### 📁 Handover register")
     st.dataframe(
