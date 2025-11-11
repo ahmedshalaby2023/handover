@@ -7,7 +7,7 @@ import sqlite3
 import uuid
 from pathlib import Path
 from urllib.parse import quote
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -185,6 +185,8 @@ def build_graphviz_workflow(steps_df: pd.DataFrame) -> Optional[str]:
 
     row_chunks: Dict[int, List[str]] = {}
     node_count = 0
+    existing_nodes: Dict[int, str] = {}
+    order_to_node: Dict[int, str] = {}
 
     for row in ordered.itertuples():
         if pd.isna(row.step_id):
@@ -202,6 +204,9 @@ def build_graphviz_workflow(steps_df: pd.DataFrame) -> Optional[str]:
         lines.append(
             f'    {node_name} [label="{label}", shape={shape}, color="{border_color}", penwidth=2, fontsize=22, width={width:.2f}];'
         )
+
+        existing_nodes[step_id] = node_name
+        order_to_node[int(row.step_order)] = node_name
 
         if first_step_id is None:
             first_step_id = step_id
@@ -239,7 +244,27 @@ def build_graphviz_workflow(steps_df: pd.DataFrame) -> Optional[str]:
         no_target = getattr(row, "no_step_id", None)
         has_no_branch = bool(no_target is not None and not pd.isna(no_target))
 
+        outgoing_edges: Set[Tuple[Optional[str], Optional[str]]] = set()
+
         def edge(target_raw: Optional[object], label_text: Optional[str]) -> None:
+            target_name: Optional[str] = None
+            target_key: Optional[int] = None
+            if target_raw is not None and not pd.isna(target_raw):
+                try:
+                    target_key = int(target_raw)
+                except (TypeError, ValueError):
+                    target_key = None
+
+            if target_key is not None:
+                target_name = existing_nodes.get(target_key)
+                if target_name is None:
+                    target_name = order_to_node.get(target_key)
+
+            signature = (target_name, label_text)
+            if signature in outgoing_edges:
+                return
+            outgoing_edges.add(signature)
+
             attrs: List[str] = []
             if label_text:
                 safe_label = _graphviz_label(label_text)
@@ -250,13 +275,13 @@ def build_graphviz_workflow(steps_df: pd.DataFrame) -> Optional[str]:
                 elif label_text.lower() == "no":
                     attrs.append('color="#C53030"')
                     attrs.append('fontcolor="#C53030"')
-            if target_raw is None or pd.isna(target_raw):
-                attr_part = f" [{' ,'.join(attrs)}]" if attrs else ""
+                    attrs.append('style="dotted"')
+            if target_name is None:
+                attr_part = f" [ {' ,'.join(attrs)} ]".replace(" [  ]", "") if attrs else ""
                 lines.append(f'    {current} -> finish{attr_part};')
                 return
 
-            target_name = node_id(int(target_raw))
-            attr_part = f" [{' ,'.join(attrs)}]" if attrs else ""
+            attr_part = f" [ {' ,'.join(attrs)} ]".replace(" [  ]", "") if attrs else ""
             lines.append(f'    {current} -> {target_name}{attr_part};')
 
         if has_no_branch:
@@ -999,6 +1024,9 @@ def render_workflows() -> None:
                         st.error("Add at least one step before saving.")
                     else:
                         try:
+                            valid_step_ids: Set[int] = set(
+                                table_source["step_id"].dropna().astype(int).tolist()
+                            )
                             original_ids = set(
                                 table_source["step_id"].dropna().astype(int).tolist()
                             )
@@ -1025,6 +1053,12 @@ def render_workflows() -> None:
 
                                 yes_val = None if pd.isna(yes_raw) else int(yes_raw)
                                 no_val = None if pd.isna(no_raw) else int(no_raw)
+                                for value, label in ((yes_val, "Yes"), (no_val, "No")):
+                                    if value is not None and value not in valid_step_ids:
+                                        raise ValueError(
+                                            f"{label} → Step ID {value} does not exist yet. "
+                                            "Use one of the Step ID values listed in the table."
+                                        )
                                 payload = {
                                     "step_order": int(order_raw),
                                     "title": title_raw.strip(),
