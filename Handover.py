@@ -3,9 +3,10 @@ from __future__ import annotations
 import datetime as dt
 import io
 import sqlite3
+import uuid
 from pathlib import Path
 from urllib.parse import quote
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -46,6 +47,98 @@ STATUS_COLORS = {
     "Archived": "#7f7f7f",
 }
 
+WORKFLOW_STATUS_OPTIONS = ["Not Started", "In Progress", "Waiting", "Completed"]
+
+def _graphviz_label(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("\n", "\\n").replace("\"", "\\\"")
+
+
+def _wrap_title(title: str, words_per_line: int = 4) -> str:
+    tokens = title.strip().split()
+    if len(tokens) <= words_per_line:
+        return title.strip()
+
+    lines = []
+    for idx in range(0, len(tokens), words_per_line):
+        lines.append(" ".join(tokens[idx : idx + words_per_line]))
+    return "\n".join(lines)
+
+
+def build_graphviz_workflow(steps_df: pd.DataFrame) -> Optional[str]:
+    if steps_df.empty:
+        return None
+
+    ordered = steps_df.sort_values("step_order")
+    lines: List[str] = [
+        "digraph Workflow {",
+        "    rankdir=LR;",
+        '    graph [splines=true, nodesep=0.8, ranksep=1.1];',
+        '    node [shape=rectangle, style="rounded,filled", fontname="Helvetica", fontsize=22, fillcolor="#F7FAFC", color="#4A5568", fontcolor="#1A202C"];',
+        '    edge [fontname="Helvetica", fontsize=12, color="#4A5568"];',
+    ]
+
+    lines.append('    start [label="Start", shape=circle, style="filled", fillcolor="#C1E1C1", color="#2F855A", fontcolor="#1A202C", fontsize=22];')
+    lines.append('    finish [label="Finish", shape=doublecircle, style="filled", fillcolor="#C1E1C1", color="#2F855A", fontcolor="#1A202C", fontsize=22];')
+
+    def node_id(step_id: int) -> str:
+        return f"step_{int(step_id)}"
+
+    first_step_id: Optional[int] = None
+
+    for row in ordered.itertuples():
+        if pd.isna(row.step_id):
+            continue
+
+        step_id = int(row.step_id)
+        node_name = node_id(step_id)
+        wrapped_title = _wrap_title(row.step_title.strip())
+        title = f"Step {int(row.step_order)}: {wrapped_title}"
+        label = _graphviz_label(title)
+        is_decision = bool(getattr(row, "no_step_id", None) and not pd.isna(row.no_step_id))
+        shape = "diamond" if is_decision else "rectangle"
+        border_color = status_color(row.step_status)
+        lines.append(
+            f'    {node_name} [label="{label}", shape={shape}, color="{border_color}", penwidth=2, fontsize=22];'
+        )
+
+        if first_step_id is None:
+            first_step_id = step_id
+
+    if first_step_id is None:
+        lines.append('    start -> finish;')
+    else:
+        lines.append(f'    start -> {node_id(first_step_id)};')
+
+    for row in ordered.itertuples():
+        if pd.isna(row.step_id):
+            continue
+
+        current = node_id(int(row.step_id))
+        yes_target = getattr(row, "yes_step_id", None)
+        no_target = getattr(row, "no_step_id", None)
+        has_no_branch = bool(no_target is not None and not pd.isna(no_target))
+
+        def edge(target_raw: Optional[object], label_text: Optional[str]) -> None:
+            if target_raw is None or pd.isna(target_raw):
+                label_part = f' [label="{_graphviz_label(label_text)}"]' if label_text else ""
+                lines.append(f'    {current} -> finish{label_part};')
+                return
+
+            target_name = node_id(int(target_raw))
+            if label_text:
+                lines.append(f'    {current} -> {target_name} [label="{_graphviz_label(label_text)}"];')
+            else:
+                lines.append(f'    {current} -> {target_name};')
+
+        if has_no_branch:
+            edge(yes_target, "Yes")
+            edge(no_target, "No")
+        else:
+            edge(yes_target, None)
+
+    lines.append('}')
+    return "\n".join(lines)
+
 
 def status_badge(status: str) -> str:
     return STATUS_BADGES.get(status, status)
@@ -53,6 +146,78 @@ def status_badge(status: str) -> str:
 
 def status_color(status: str) -> str:
     return STATUS_COLORS.get(status, "#636EFA")
+
+
+def ensure_workflow_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS workflow_processes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            owner TEXT,
+            description TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS workflow_steps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workflow_id INTEGER NOT NULL,
+            step_order INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL,
+            yes_step_id INTEGER,
+            no_step_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (workflow_id) REFERENCES workflow_processes(id) ON DELETE CASCADE
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_workflow_steps_workflow
+        ON workflow_steps (workflow_id, step_order)
+        """
+    )
+    _ensure_workflow_step_branch_columns(conn)
+    conn.commit()
+
+
+def _ensure_workflow_step_branch_columns(conn: sqlite3.Connection) -> None:
+    existing_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info('workflow_steps')")
+    }
+    if "yes_step_id" not in existing_columns:
+        conn.execute("ALTER TABLE workflow_steps ADD COLUMN yes_step_id INTEGER")
+    if "no_step_id" not in existing_columns:
+        conn.execute("ALTER TABLE workflow_steps ADD COLUMN no_step_id INTEGER")
+
+
+def init_db() -> None:
+    """Ensure the handover table exists."""
+
+    with get_connection() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS handover_topics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                person TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                meeting_date TEXT NOT NULL,
+                details TEXT,
+                status TEXT NOT NULL,
+                next_steps TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        ensure_workflow_tables(conn)
 
 
 def build_excel_report(df: pd.DataFrame) -> bytes:
@@ -289,6 +454,349 @@ def load_topics(filters: Dict[str, Iterable[str]]) -> pd.DataFrame:
 
 def clear_cached_topics() -> None:
     load_topics.clear()  # type: ignore[attr-defined]
+
+
+def add_workflow_process(name: str, owner: str, description: str, steps: List[str]) -> None:
+    init_db()
+    now_iso = dt.datetime.utcnow().isoformat(timespec="seconds")
+    payload = (name.strip(), owner.strip(), description.strip(), now_iso)
+
+    for attempt in (1, 2):
+        try:
+            with get_connection() as conn:
+                ensure_workflow_tables(conn)
+                cursor = conn.execute(
+                    """
+                    INSERT INTO workflow_processes (name, owner, description, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    payload,
+                )
+                workflow_id = cursor.lastrowid
+
+                inserted_ids: List[int] = []
+                for order, title in enumerate(steps, start=1):
+                    step_cursor = conn.execute(
+                        """
+                        INSERT INTO workflow_steps (
+                            workflow_id, step_order, title, status, yes_step_id, no_step_id, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            workflow_id,
+                            order,
+                            title.strip(),
+                            "Not Started",
+                            None,
+                            None,
+                            now_iso,
+                            now_iso,
+                        ),
+                    )
+                    inserted_ids.append(int(step_cursor.lastrowid))
+
+                for idx, step_id in enumerate(inserted_ids):
+                    yes_target = inserted_ids[idx + 1] if idx + 1 < len(inserted_ids) else None
+                    conn.execute(
+                        "UPDATE workflow_steps SET yes_step_id = ? WHERE id = ?",
+                        (yes_target, step_id),
+                    )
+            break
+        except sqlite3.OperationalError as exc:
+            if attempt == 2 or "workflow_processes" not in str(exc):
+                raise
+            init_db()
+
+
+def fetch_workflows() -> pd.DataFrame:
+    init_db()
+    query = """
+        SELECT
+            w.id AS workflow_id,
+            w.name AS workflow_name,
+            w.owner AS workflow_owner,
+            w.description AS workflow_description,
+            w.created_at AS workflow_created_at,
+            s.id AS step_id,
+            s.step_order,
+            s.title AS step_title,
+            s.status AS step_status,
+            s.yes_step_id,
+            s.no_step_id,
+            s.updated_at AS step_updated_at
+        FROM workflow_processes w
+        LEFT JOIN workflow_steps s ON s.workflow_id = w.id
+        ORDER BY w.created_at DESC, s.step_order ASC
+    """
+
+    try:
+        with get_connection() as conn:
+            df = pd.read_sql_query(query, conn)
+    except (sqlite3.OperationalError, pd.errors.DatabaseError) as exc:
+        if "workflow_processes" in str(exc):
+            return pd.DataFrame(
+                columns=[
+                    "workflow_id",
+                    "workflow_name",
+                    "workflow_owner",
+                    "workflow_description",
+                    "workflow_created_at",
+                    "step_id",
+                    "step_order",
+                    "step_title",
+                    "step_status",
+                    "yes_step_id",
+                    "no_step_id",
+                    "step_updated_at",
+                ]
+            )
+        raise
+
+    if not df.empty:
+        df["workflow_created_at"] = pd.to_datetime(df["workflow_created_at"])
+        if "step_updated_at" in df.columns:
+            df["step_updated_at"] = pd.to_datetime(df["step_updated_at"])
+
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def load_workflows() -> pd.DataFrame:
+    return fetch_workflows()
+
+
+def clear_cached_workflows() -> None:
+    load_workflows.clear()  # type: ignore[attr-defined]
+
+
+def trigger_rerun() -> None:
+    rerun = getattr(st, "rerun", None)
+    if callable(rerun):
+        rerun()
+        return
+
+    experimental_rerun = getattr(st, "experimental_rerun", None)
+    if callable(experimental_rerun):
+        experimental_rerun()
+
+
+def update_workflow_steps(step_updates: Dict[int, Tuple[str, Optional[int], Optional[int]]]) -> None:
+    if not step_updates:
+        return
+
+    init_db()
+    now_iso = dt.datetime.utcnow().isoformat(timespec="seconds")
+    for attempt in (1, 2):
+        try:
+            with get_connection() as conn:
+                ensure_workflow_tables(conn)
+                for step_id, payload in step_updates.items():
+                    status, yes_step, no_step = payload
+                    conn.execute(
+                        """
+                        UPDATE workflow_steps
+                        SET status = ?, yes_step_id = ?, no_step_id = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (status, yes_step, no_step, now_iso, step_id),
+                    )
+            break
+        except sqlite3.OperationalError as exc:
+            if attempt == 2 or "workflow_steps" not in str(exc):
+                raise
+            init_db()
+
+
+def delete_workflow_process(workflow_id: int) -> None:
+    init_db()
+    for attempt in (1, 2):
+        try:
+            with get_connection() as conn:
+                ensure_workflow_tables(conn)
+                conn.execute(
+                    "DELETE FROM workflow_processes WHERE id = ?",
+                    (int(workflow_id),),
+                )
+            break
+        except sqlite3.OperationalError as exc:
+            if attempt == 2 or "workflow_processes" not in str(exc):
+                raise
+            init_db()
+
+
+def render_workflow_diagram(steps_df: pd.DataFrame) -> None:
+    graphviz_code = build_graphviz_workflow(steps_df)
+    if graphviz_code:
+        st.graphviz_chart(graphviz_code, use_container_width=True)
+
+
+def render_workflows() -> None:
+    st.subheader("🧭 Process workflow builder")
+    st.markdown(
+        "Establish repeatable handover steps and track their progress visually.")
+
+    with st.form("create_workflow_form", clear_on_submit=True):
+        name = st.text_input("Workflow name", placeholder="e.g., New manager onboarding")
+        owner = st.text_input("Owner (optional)", placeholder="Who leads this process?")
+        description = st.text_area(
+            "Description",
+            placeholder="What is the goal and scope of this workflow?",
+        )
+        steps_text = st.text_area(
+            "Workflow steps (one per line)",
+            placeholder="Kick-off alignment\nTool access handover\nShadowing and sign-off",
+        )
+        create_submitted = st.form_submit_button("Create workflow", type="primary")
+
+    if create_submitted:
+        steps = [line.strip() for line in steps_text.splitlines() if line.strip()]
+        if not name.strip():
+            st.error("Workflow name is required.")
+        elif not steps:
+            st.error("Add at least one workflow step.")
+        else:
+            add_workflow_process(name, owner, description, steps)
+            clear_cached_workflows()
+            st.success("Workflow created.")
+            trigger_rerun()
+
+    df = load_workflows()
+
+    if df.empty or df["workflow_id"].isna().all():
+        st.info("No workflows captured yet. Use the form above to build your first one.")
+        return
+
+    with st.expander("Manage workflows", expanded=False):
+        unique_workflows = (
+            df.dropna(subset=["workflow_id"]).sort_values("workflow_created_at", ascending=False)
+        )
+        workflow_choices = {}
+        for row in unique_workflows.itertuples():
+            label_bits = [row.workflow_name]
+            if isinstance(row.workflow_owner, str) and row.workflow_owner.strip():
+                label_bits.append(f"Owner: {row.workflow_owner.strip()}")
+            created_at = getattr(row, "workflow_created_at", None)
+            if pd.notna(created_at):
+                label_bits.append(created_at.strftime("%d %b %Y"))
+            label = " · ".join(label_bits)
+            workflow_choices[label] = int(row.workflow_id)
+
+        if workflow_choices:
+            col_pick, col_delete = st.columns([3, 1])
+            with col_pick:
+                selected_label = st.selectbox(
+                    "Select a workflow to delete",
+                    options=list(workflow_choices.keys()),
+                    key="workflow_delete_select",
+                )
+            with col_delete:
+                if st.button("Delete", key="workflow_delete_button"):
+                    delete_workflow_process(workflow_choices[selected_label])
+                    clear_cached_workflows()
+                    st.success("Workflow removed.")
+                    trigger_rerun()
+        else:
+            st.info("No workflows available to delete.")
+
+    grouped = df.groupby("workflow_id", sort=False)
+    for workflow_id, group in grouped:
+        workflow = group.iloc[0]
+        steps_df = group.dropna(subset=["step_id"]).sort_values("step_order")
+
+        header = workflow["workflow_name"]
+        meta_bits: List[str] = []
+        if isinstance(workflow.get("workflow_owner"), str) and workflow["workflow_owner"].strip():
+            meta_bits.append(f"Owner: {workflow['workflow_owner'].strip()}")
+        created_at = workflow.get("workflow_created_at")
+        if pd.notna(created_at):
+            meta_bits.append(f"Created {created_at.strftime('%d %b %Y')}")
+
+        expander_label = header
+        if meta_bits:
+            expander_label = f"{header} · {' · '.join(meta_bits)}"
+
+        with st.expander(expander_label, expanded=False):
+            description = workflow.get("workflow_description")
+            if isinstance(description, str) and description.strip():
+                st.markdown(description.strip())
+
+            if steps_df.empty:
+                st.info("No steps logged for this workflow yet.")
+                continue
+
+            render_workflow_diagram(steps_df)
+
+            step_labels = {
+                None: "End workflow",
+                **{
+                    int(step.step_id): f"Step {step.step_order}: {step.step_title}"
+                    for step in steps_df.itertuples()
+                },
+            }
+            step_option_order = [None] + [key for key in step_labels.keys() if key is not None]
+
+            updates: Dict[int, Tuple[str, Optional[int], Optional[int]]] = {}
+            with st.form(f"update_workflow_{workflow_id}"):
+                st.markdown("#### Update step progress & routing")
+                for step in steps_df.itertuples():
+                    status_index = (
+                        WORKFLOW_STATUS_OPTIONS.index(step.step_status)
+                        if step.step_status in WORKFLOW_STATUS_OPTIONS
+                        else 0
+                    )
+                    status_choice = st.selectbox(
+                        f"Status · Step {step.step_order}: {step.step_title}",
+                        options=WORKFLOW_STATUS_OPTIONS,
+                        index=status_index,
+                        format_func=status_badge,
+                        key=f"workflow_step_status_{step.step_id}",
+                    )
+
+                    yes_default_val = getattr(step, "yes_step_id", None)
+                    yes_default = (
+                        None
+                        if pd.isna(yes_default_val) or yes_default_val is None
+                        else int(yes_default_val)
+                    )
+                    if yes_default not in step_option_order:
+                        yes_default = None
+                    yes_index = step_option_order.index(yes_default)
+                    yes_choice = st.selectbox(
+                        f"If *Yes* →",
+                        options=step_option_order,
+                        index=yes_index,
+                        format_func=lambda value, labels=step_labels: labels.get(value, "Unknown step"),
+                        key=f"workflow_step_yes_{step.step_id}",
+                    )
+
+                    no_default_val = getattr(step, "no_step_id", None)
+                    no_default = (
+                        None if pd.isna(no_default_val) or no_default_val is None else int(no_default_val)
+                    )
+                    if no_default not in step_option_order:
+                        no_default = None
+                    no_index = step_option_order.index(no_default)
+                    no_choice = st.selectbox(
+                        f"If *No* →", 
+                        options=step_option_order,
+                        index=no_index,
+                        format_func=lambda value, labels=step_labels: labels.get(value, "Unknown step"),
+                        key=f"workflow_step_no_{step.step_id}",
+                    )
+
+                    yes_choice = None if yes_choice is None else int(yes_choice)
+                    no_choice = None if no_choice is None else int(no_choice)
+                    updates[int(step.step_id)] = (status_choice, yes_choice, no_choice)
+
+                update_submitted = st.form_submit_button(
+                    "Save updates", type="secondary"
+                )
+
+            if update_submitted:
+                update_workflow_steps(updates)
+                clear_cached_workflows()
+                st.success("Workflow status updated.")
+                trigger_rerun()
 
 
 def render_add_topic() -> None:
@@ -552,13 +1060,18 @@ def main() -> None:
 
     init_db()
 
-    tab_add, tab_review = st.tabs(["Add topic", "Review & update"])
+    tab_add, tab_review, tab_workflow = st.tabs(
+        ["Add topic", "Review & update", "Workflow builder"]
+    )
 
     with tab_add:
         render_add_topic()
 
     with tab_review:
         render_review()
+
+    with tab_workflow:
+        render_workflows()
 
 
 if __name__ == "__main__":
