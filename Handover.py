@@ -162,21 +162,27 @@ def render_barfi_editor(workflow_label: str, workflow_id: int) -> None:
     )
 
 
-def build_graphviz_workflow(steps_df: pd.DataFrame) -> Optional[str]:
+def build_graphviz_workflow(steps_df: pd.DataFrame, font_size: int = 26) -> Optional[str]:
     if steps_df.empty:
         return None
 
     ordered = steps_df.sort_values("step_order")
+    node_font = max(12, font_size)
+    font_scale = node_font / 22
     lines: List[str] = [
         "digraph Workflow {",
         "    rankdir=LR;",
         '    graph [splines=ortho, nodesep=0.8, ranksep=1.1];',
-        '    node [shape=rectangle, style="rounded,filled", fontname="Helvetica", fontsize=26, fillcolor="#F7FAFC", color="#4A5568", fontcolor="#1A202C", fixedsize=false];',
+        f'    node [shape=rectangle, style="rounded,filled", fontname="Helvetica", fontsize={node_font}, fillcolor="#F7FAFC", color="#4A5568", fontcolor="#1A202C", fixedsize=false];',
         '    edge [fontname="Helvetica", fontsize=22, color="#4A5568"];',
     ]
 
-    lines.append('    start [label="Start", shape=circle, style="filled", fillcolor="#C1E1C1", color="#2F855A", fontcolor="#1A202C", fontsize=26];')
-    lines.append('    finish [label="Finish", shape=doublecircle, style="filled", fillcolor="#C1E1C1", color="#2F855A", fontcolor="#1A202C", fontsize=26];')
+    lines.append(
+        f'    start [label="Start", shape=circle, style="filled", fillcolor="#C1E1C1", color="#2F855A", fontcolor="#1A202C", fontsize={node_font}];'
+    )
+    lines.append(
+        f'    finish [label="Finish", shape=doublecircle, style="filled", fillcolor="#C1E1C1", color="#2F855A", fontcolor="#1A202C", fontsize={node_font}];'
+    )
 
     def node_id(step_id: int) -> str:
         return f"step_{int(step_id)}"
@@ -197,13 +203,13 @@ def build_graphviz_workflow(steps_df: pd.DataFrame) -> Optional[str]:
         node_name = node_id(step_id)
         wrapped_title = _wrap_title(row.step_title.strip())
         title = f"Step {int(row.step_order)}: {wrapped_title}"
-        width = _estimate_node_width(title)
+        width = _estimate_node_width(title) * font_scale
         label = _graphviz_label(title)
         is_decision = bool(getattr(row, "no_step_id", None) and not pd.isna(row.no_step_id))
         shape = "diamond" if is_decision else "rectangle"
         border_color = "#4A5568"
         lines.append(
-            f'    {node_name} [label="{label}", shape={shape}, color="{border_color}", penwidth=2, fontsize=26, width={width:.2f}];'
+            f'    {node_name} [label="{label}", shape={shape}, color="{border_color}", penwidth=2, fontsize={node_font}, width={width:.2f}];'
         )
 
         step_order_val = int(row.step_order)
@@ -866,8 +872,8 @@ def delete_workflow_process(workflow_id: int) -> None:
             init_db()
 
 
-def render_workflow_diagram(steps_df: pd.DataFrame) -> None:
-    graphviz_code = build_graphviz_workflow(steps_df)
+def render_workflow_diagram(steps_df: pd.DataFrame, font_size: int) -> None:
+    graphviz_code = build_graphviz_workflow(steps_df, font_size=font_size)
     if graphviz_code:
         st.graphviz_chart(graphviz_code, use_container_width=True)
 
@@ -940,6 +946,26 @@ def render_workflows() -> None:
         else:
             st.info("No workflows available to delete.")
 
+    st.session_state.setdefault("workflow_font_size", 26)
+
+    font_col, _, reset_col = st.columns([2, 3, 1])
+    with font_col:
+        st.caption("Workflow diagram font size")
+        cols = st.columns([1, 1, 2])
+        with cols[0]:
+            if st.button("−", key="workflow_font_minus"):
+                st.session_state["workflow_font_size"] = max(12, st.session_state["workflow_font_size"] - 2)
+        with cols[1]:
+            if st.button("+", key="workflow_font_plus"):
+                st.session_state["workflow_font_size"] = min(60, st.session_state["workflow_font_size"] + 2)
+        with cols[2]:
+            st.write(f"**{st.session_state['workflow_font_size']} pt**")
+    with reset_col:
+        if st.button("Reset", key="workflow_font_reset"):
+            st.session_state["workflow_font_size"] = 26
+
+    font_size = st.session_state["workflow_font_size"]
+
     grouped = df.groupby("workflow_id", sort=False)
     for workflow_id, group in grouped:
         workflow = group.iloc[0]
@@ -971,7 +997,7 @@ def render_workflows() -> None:
                 if steps_df.empty:
                     st.info("No steps logged for this workflow yet. Use the table below to add steps.")
                 else:
-                    render_workflow_diagram(steps_df)
+                    render_workflow_diagram(steps_df, font_size=font_size)
 
                 base_columns = ["step_id", "step_order", "step_title", "yes_step_id", "no_step_id"]
                 if steps_df.empty:
