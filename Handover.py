@@ -1301,7 +1301,7 @@ def main() -> None:
         """
         <style>
             :root {
-                font-size: 50px;
+                font-size: 18px;
             }
             body, .block-container {
                 font-size: 2rem !important;
