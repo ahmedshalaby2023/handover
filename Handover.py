@@ -183,6 +183,9 @@ def build_graphviz_workflow(steps_df: pd.DataFrame) -> Optional[str]:
 
     first_step_id: Optional[int] = None
 
+    row_chunks: Dict[int, List[str]] = {}
+    node_count = 0
+
     for row in ordered.itertuples():
         if pd.isna(row.step_id):
             continue
@@ -203,10 +206,29 @@ def build_graphviz_workflow(steps_df: pd.DataFrame) -> Optional[str]:
         if first_step_id is None:
             first_step_id = step_id
 
+        row_index = node_count // 4
+        row_chunks.setdefault(row_index, []).append(node_name)
+        node_count += 1
+
     if first_step_id is None:
         lines.append('    start -> finish;')
     else:
         lines.append(f'    start -> {node_id(first_step_id)};')
+
+    if row_chunks:
+        for row_index, nodes_in_row in sorted(row_chunks.items()):
+            if not nodes_in_row:
+                continue
+
+            node_list = "; ".join(nodes_in_row)
+            lines.append(f"    {{ rank=same; {node_list}; }}")
+
+            if len(nodes_in_row) > 1:
+                for left, right in zip(nodes_in_row, nodes_in_row[1:]):
+                    lines.append(f"    {left} -> {right} [style=invis, weight=5];")
+
+        lines.append("    { rank=source; start; }")
+        lines.append("    { rank=sink; finish; }")
 
     for row in ordered.itertuples():
         if pd.isna(row.step_id):
