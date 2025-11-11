@@ -171,12 +171,12 @@ def build_graphviz_workflow(steps_df: pd.DataFrame) -> Optional[str]:
         "digraph Workflow {",
         "    rankdir=LR;",
         '    graph [splines=ortho, nodesep=0.8, ranksep=1.1];',
-        '    node [shape=rectangle, style="rounded,filled", fontname="Helvetica", fontsize=22, fillcolor="#F7FAFC", color="#4A5568", fontcolor="#1A202C", fixedsize=false];',
+        '    node [shape=rectangle, style="rounded,filled", fontname="Helvetica", fontsize=26, fillcolor="#F7FAFC", color="#4A5568", fontcolor="#1A202C", fixedsize=false];',
         '    edge [fontname="Helvetica", fontsize=22, color="#4A5568"];',
     ]
 
-    lines.append('    start [label="Start", shape=circle, style="filled", fillcolor="#C1E1C1", color="#2F855A", fontcolor="#1A202C", fontsize=22];')
-    lines.append('    finish [label="Finish", shape=doublecircle, style="filled", fillcolor="#C1E1C1", color="#2F855A", fontcolor="#1A202C", fontsize=22];')
+    lines.append('    start [label="Start", shape=circle, style="filled", fillcolor="#C1E1C1", color="#2F855A", fontcolor="#1A202C", fontsize=26];')
+    lines.append('    finish [label="Finish", shape=doublecircle, style="filled", fillcolor="#C1E1C1", color="#2F855A", fontcolor="#1A202C", fontsize=26];')
 
     def node_id(step_id: int) -> str:
         return f"step_{int(step_id)}"
@@ -203,7 +203,7 @@ def build_graphviz_workflow(steps_df: pd.DataFrame) -> Optional[str]:
         shape = "diamond" if is_decision else "rectangle"
         border_color = "#4A5568"
         lines.append(
-            f'    {node_name} [label="{label}", shape={shape}, color="{border_color}", penwidth=2, fontsize=22, width={width:.2f}];'
+            f'    {node_name} [label="{label}", shape={shape}, color="{border_color}", penwidth=2, fontsize=26, width={width:.2f}];'
         )
 
         step_order_val = int(row.step_order)
