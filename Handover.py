@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import io
+import json
 import sqlite3
 import uuid
 from pathlib import Path
@@ -47,21 +48,118 @@ STATUS_COLORS = {
     "Archived": "#7f7f7f",
 }
 
-WORKFLOW_STATUS_OPTIONS = ["Not Started", "In Progress", "Waiting", "Completed"]
+try:
+    from barfi.flow import Block
+    from barfi.flow.streamlit import st_flow
+
+    BARFI_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional dependency
+    Block = None  # type: ignore[assignment]
+    st_flow = None  # type: ignore[assignment]
+    BARFI_AVAILABLE = False
+
 
 def _graphviz_label(text: str) -> str:
     return text.replace("\\", "\\\\").replace("\n", "\\n").replace("\"", "\\\"")
 
 
-def _wrap_title(title: str, words_per_line: int = 4) -> str:
-    tokens = title.strip().split()
-    if len(tokens) <= words_per_line:
-        return title.strip()
+def _wrap_title(title: str, max_chars: int = 40) -> str:
+    clean = title.strip()
+    if len(clean) <= max_chars:
+        return clean
 
-    lines = []
-    for idx in range(0, len(tokens), words_per_line):
-        lines.append(" ".join(tokens[idx : idx + words_per_line]))
+    tokens = clean.split()
+    if not tokens:
+        return clean
+
+    lines: List[str] = []
+    current: List[str] = []
+    current_len = 0
+
+    for token in tokens:
+        next_len = current_len + len(token) + (1 if current else 0)
+        if current and next_len > max_chars:
+            lines.append(" ".join(current))
+            current = [token]
+            current_len = len(token)
+        else:
+            current.append(token)
+            current_len = next_len
+
+    if current:
+        lines.append(" ".join(current))
+
     return "\n".join(lines)
+
+
+def _estimate_node_width(text: str, min_width: float = 3.0, char_width: float = 0.22) -> float:
+    lines = text.split("\n")
+    longest = max((len(line) for line in lines), default=len(text))
+    return max(min_width, longest * char_width)
+
+
+def _barfi_base_blocks() -> List["Block"]:
+    if not BARFI_AVAILABLE:
+        return []
+
+    step_block = Block(name="Step")
+    step_block.add_input(name="In")
+    step_block.add_output(name="Next")
+
+    decision_block = Block(name="Decision")
+    decision_block.add_input(name="In")
+    decision_block.add_output(name="Yes")
+    decision_block.add_output(name="No")
+
+    end_block = Block(name="End")
+    end_block.add_input(name="In")
+
+    return [step_block, decision_block, end_block]
+
+
+def render_barfi_editor(workflow_label: str, workflow_id: int) -> None:
+    if not BARFI_AVAILABLE or st_flow is None:
+        st.info(
+            "Install `barfi[streamlit]` to unlock the drag-and-drop editor.\n"
+            "Run: `pip install \"barfi[streamlit]\"`.",
+            icon="ℹ️",
+        )
+        return
+
+    st.caption(
+        "Beta: Build or rearrange workflow steps visually. Drag blocks from the right-click menu, "
+        "connect outputs to inputs, then review the generated schema below. Saving back to the register "
+        "will be added in a follow-up iteration."
+    )
+
+    base_blocks = _barfi_base_blocks()
+    if not base_blocks:
+        st.warning("No Barfi blocks available.")
+        return
+
+    barfi_key = f"workflow_barfi_{workflow_id}"
+    editor_result = st_flow(base_blocks, key=barfi_key)
+
+    schema = getattr(editor_result, "editor_schema", None)
+    if schema is None:
+        st.info("Create nodes and click Execute in the editor to produce a schema.")
+        return
+
+    try:
+        schema_payload = schema.dict()  # type: ignore[attr-defined]
+    except AttributeError:
+        try:
+            schema_payload = schema.to_dict()  # type: ignore[attr-defined]
+        except AttributeError:
+            schema_payload = schema
+
+    st.markdown("##### Generated Barfi schema")
+    st.code(json.dumps(schema_payload, indent=2, default=str), language="json")
+    st.info(
+        "Schema persistence back to the workflow database is not yet wired. \n"
+        "Use the above JSON as a reference or export template for now.",
+        icon="🛠️",
+    )
 
 
 def build_graphviz_workflow(steps_df: pd.DataFrame) -> Optional[str]:
@@ -73,8 +171,8 @@ def build_graphviz_workflow(steps_df: pd.DataFrame) -> Optional[str]:
         "digraph Workflow {",
         "    rankdir=LR;",
         '    graph [splines=true, nodesep=0.8, ranksep=1.1];',
-        '    node [shape=rectangle, style="rounded,filled", fontname="Helvetica", fontsize=22, fillcolor="#F7FAFC", color="#4A5568", fontcolor="#1A202C"];',
-        '    edge [fontname="Helvetica", fontsize=12, color="#4A5568"];',
+        '    node [shape=rectangle, style="rounded,filled", fontname="Helvetica", fontsize=22, fillcolor="#F7FAFC", color="#4A5568", fontcolor="#1A202C", fixedsize=false];',
+        '    edge [fontname="Helvetica", fontsize=22, color="#4A5568"];',
     ]
 
     lines.append('    start [label="Start", shape=circle, style="filled", fillcolor="#C1E1C1", color="#2F855A", fontcolor="#1A202C", fontsize=22];')
@@ -93,12 +191,13 @@ def build_graphviz_workflow(steps_df: pd.DataFrame) -> Optional[str]:
         node_name = node_id(step_id)
         wrapped_title = _wrap_title(row.step_title.strip())
         title = f"Step {int(row.step_order)}: {wrapped_title}"
+        width = _estimate_node_width(title)
         label = _graphviz_label(title)
         is_decision = bool(getattr(row, "no_step_id", None) and not pd.isna(row.no_step_id))
         shape = "diamond" if is_decision else "rectangle"
-        border_color = status_color(row.step_status)
+        border_color = "#4A5568"
         lines.append(
-            f'    {node_name} [label="{label}", shape={shape}, color="{border_color}", penwidth=2, fontsize=22];'
+            f'    {node_name} [label="{label}", shape={shape}, color="{border_color}", penwidth=2, fontsize=22, width={width:.2f}];'
         )
 
         if first_step_id is None:
@@ -119,16 +218,24 @@ def build_graphviz_workflow(steps_df: pd.DataFrame) -> Optional[str]:
         has_no_branch = bool(no_target is not None and not pd.isna(no_target))
 
         def edge(target_raw: Optional[object], label_text: Optional[str]) -> None:
+            attrs: List[str] = []
+            if label_text:
+                safe_label = _graphviz_label(label_text)
+                attrs.append(f'label="{safe_label}"')
+                if label_text.lower() == "yes":
+                    attrs.append('color="#2F855A"')
+                    attrs.append('fontcolor="#2F855A"')
+                elif label_text.lower() == "no":
+                    attrs.append('color="#C53030"')
+                    attrs.append('fontcolor="#C53030"')
             if target_raw is None or pd.isna(target_raw):
-                label_part = f' [label="{_graphviz_label(label_text)}"]' if label_text else ""
-                lines.append(f'    {current} -> finish{label_part};')
+                attr_part = f" [{' ,'.join(attrs)}]" if attrs else ""
+                lines.append(f'    {current} -> finish{attr_part};')
                 return
 
             target_name = node_id(int(target_raw))
-            if label_text:
-                lines.append(f'    {current} -> {target_name} [label="{_graphviz_label(label_text)}"];')
-            else:
-                lines.append(f'    {current} -> {target_name};')
+            attr_part = f" [{' ,'.join(attrs)}]" if attrs else ""
+            lines.append(f'    {current} -> {target_name}{attr_part};')
 
         if has_no_branch:
             edge(yes_target, "Yes")
@@ -580,7 +687,7 @@ def trigger_rerun() -> None:
         experimental_rerun()
 
 
-def update_workflow_steps(step_updates: Dict[int, Tuple[str, Optional[int], Optional[int]]]) -> None:
+def update_workflow_steps(step_updates: Dict[int, Dict[str, object]]) -> None:
     if not step_updates:
         return
 
@@ -590,16 +697,94 @@ def update_workflow_steps(step_updates: Dict[int, Tuple[str, Optional[int], Opti
         try:
             with get_connection() as conn:
                 ensure_workflow_tables(conn)
-                for step_id, payload in step_updates.items():
-                    status, yes_step, no_step = payload
+                for step_id, fields in step_updates.items():
+                    if not fields:
+                        continue
+
+                    columns: List[str] = []
+                    values: List[object] = []
+
+                    for column in ("title", "step_order", "yes_step_id", "no_step_id"):
+                        if column in fields:
+                            if column == "title" and isinstance(fields[column], str):
+                                values.append(fields[column].strip())
+                            else:
+                                values.append(fields[column])
+                            columns.append(f"{column} = ?")
+
+                    if not columns:
+                        continue
+
+                    columns.append("updated_at = ?")
+                    values.append(now_iso)
+                    values.append(step_id)
+
                     conn.execute(
-                        """
-                        UPDATE workflow_steps
-                        SET status = ?, yes_step_id = ?, no_step_id = ?, updated_at = ?
-                        WHERE id = ?
-                        """,
-                        (status, yes_step, no_step, now_iso, step_id),
+                        f"UPDATE workflow_steps SET {', '.join(columns)} WHERE id = ?",
+                        values,
                     )
+            break
+        except sqlite3.OperationalError as exc:
+            if attempt == 2 or "workflow_steps" not in str(exc):
+                raise
+            init_db()
+
+
+def insert_workflow_step(
+    workflow_id: int,
+    step_order: int,
+    title: str,
+    yes_step_id: Optional[int],
+    no_step_id: Optional[int],
+) -> int:
+    init_db()
+    now_iso = dt.datetime.utcnow().isoformat(timespec="seconds")
+    payload = (
+        int(workflow_id),
+        int(step_order),
+        title.strip(),
+        "Not Started",
+        yes_step_id,
+        no_step_id,
+        now_iso,
+        now_iso,
+    )
+
+    for attempt in (1, 2):
+        try:
+            with get_connection() as conn:
+                ensure_workflow_tables(conn)
+                cursor = conn.execute(
+                    """
+                    INSERT INTO workflow_steps (
+                        workflow_id, step_order, title, status, yes_step_id, no_step_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    payload,
+                )
+                return int(cursor.lastrowid)
+        except sqlite3.OperationalError as exc:
+            if attempt == 2 or "workflow_steps" not in str(exc):
+                raise
+            init_db()
+    return 0
+
+
+def delete_workflow_steps(step_ids: Iterable[int]) -> None:
+    ids = [int(step_id) for step_id in step_ids]
+    if not ids:
+        return
+
+    init_db()
+    for attempt in (1, 2):
+        try:
+            with get_connection() as conn:
+                ensure_workflow_tables(conn)
+                placeholders = ",".join("?" for _ in ids)
+                conn.execute(
+                    f"DELETE FROM workflow_steps WHERE id IN ({placeholders})",
+                    ids,
+                )
             break
         except sqlite3.OperationalError as exc:
             if attempt == 2 or "workflow_steps" not in str(exc):
@@ -720,83 +905,140 @@ def render_workflows() -> None:
             if isinstance(description, str) and description.strip():
                 st.markdown(description.strip())
 
-            if steps_df.empty:
-                st.info("No steps logged for this workflow yet.")
-                continue
+            tab_visual, tab_barfi = st.tabs([
+                "Diagram & table",
+                "Barfi editor (beta)",
+            ])
 
-            render_workflow_diagram(steps_df)
+            with tab_visual:
+                if steps_df.empty:
+                    st.info("No steps logged for this workflow yet. Use the table below to add steps.")
+                else:
+                    render_workflow_diagram(steps_df)
 
-            step_labels = {
-                None: "End workflow",
-                **{
-                    int(step.step_id): f"Step {step.step_order}: {step.step_title}"
-                    for step in steps_df.itertuples()
-                },
-            }
-            step_option_order = [None] + [key for key in step_labels.keys() if key is not None]
+                base_columns = ["step_id", "step_order", "step_title", "yes_step_id", "no_step_id"]
+                if steps_df.empty:
+                    table_source = pd.DataFrame(columns=base_columns)
+                else:
+                    table_source = steps_df[base_columns].copy()
 
-            updates: Dict[int, Tuple[str, Optional[int], Optional[int]]] = {}
-            with st.form(f"update_workflow_{workflow_id}"):
-                st.markdown("#### Update step progress & routing")
-                for step in steps_df.itertuples():
-                    status_index = (
-                        WORKFLOW_STATUS_OPTIONS.index(step.step_status)
-                        if step.step_status in WORKFLOW_STATUS_OPTIONS
-                        else 0
-                    )
-                    status_choice = st.selectbox(
-                        f"Status · Step {step.step_order}: {step.step_title}",
-                        options=WORKFLOW_STATUS_OPTIONS,
-                        index=status_index,
-                        format_func=status_badge,
-                        key=f"workflow_step_status_{step.step_id}",
-                    )
-
-                    yes_default_val = getattr(step, "yes_step_id", None)
-                    yes_default = (
-                        None
-                        if pd.isna(yes_default_val) or yes_default_val is None
-                        else int(yes_default_val)
-                    )
-                    if yes_default not in step_option_order:
-                        yes_default = None
-                    yes_index = step_option_order.index(yes_default)
-                    yes_choice = st.selectbox(
-                        f"If *Yes* →",
-                        options=step_option_order,
-                        index=yes_index,
-                        format_func=lambda value, labels=step_labels: labels.get(value, "Unknown step"),
-                        key=f"workflow_step_yes_{step.step_id}",
-                    )
-
-                    no_default_val = getattr(step, "no_step_id", None)
-                    no_default = (
-                        None if pd.isna(no_default_val) or no_default_val is None else int(no_default_val)
-                    )
-                    if no_default not in step_option_order:
-                        no_default = None
-                    no_index = step_option_order.index(no_default)
-                    no_choice = st.selectbox(
-                        f"If *No* →", 
-                        options=step_option_order,
-                        index=no_index,
-                        format_func=lambda value, labels=step_labels: labels.get(value, "Unknown step"),
-                        key=f"workflow_step_no_{step.step_id}",
-                    )
-
-                    yes_choice = None if yes_choice is None else int(yes_choice)
-                    no_choice = None if no_choice is None else int(no_choice)
-                    updates[int(step.step_id)] = (status_choice, yes_choice, no_choice)
-
-                update_submitted = st.form_submit_button(
-                    "Save updates", type="secondary"
+                table_source = table_source.rename(
+                    columns={
+                        "step_id": "step_id",
+                        "step_order": "step_order",
+                        "step_title": "title",
+                        "yes_step_id": "yes_step_id",
+                        "no_step_id": "no_step_id",
+                    }
                 )
 
-            if update_submitted:
-                update_workflow_steps(updates)
-                clear_cached_workflows()
-                st.success("Workflow status updated.")
-                trigger_rerun()
+                if "step_id" in table_source.columns:
+                    table_source["step_id"] = table_source["step_id"].astype("Int64")
+
+                row_count = max(len(table_source), 1)
+                table_height = min(700, 60 * row_count + 120)
+
+                title_len = int(table_source["title"].astype(str).str.len().max()) if not table_source.empty else 0
+                step_len = int(table_source["step_order"].astype(str).str.len().max()) if not table_source.empty else 1
+                yes_len = int(table_source["yes_step_id"].astype(str).str.len().max()) if not table_source.empty else 1
+                no_len = int(table_source["no_step_id"].astype(str).str.len().max()) if not table_source.empty else 1
+
+                def _pick_width(length: int) -> str:
+                    if length >= 25:
+                        return "large"
+                    if length >= 12:
+                        return "medium"
+                    return "small"
+
+                editor_df = st.data_editor(
+                    table_source,
+                    num_rows="dynamic",
+                    use_container_width=True,
+                    height=table_height,
+                    key=f"workflow_table_editor_{workflow_id}",
+                    column_config={
+                        "step_id": st.column_config.NumberColumn("Step ID", disabled=True, width="small"),
+                        "step_order": st.column_config.NumberColumn(
+                            "Step order", min_value=1, width=_pick_width(step_len)
+                        ),
+                        "title": st.column_config.TextColumn("Title", width=_pick_width(title_len)),
+                        "yes_step_id": st.column_config.NumberColumn(
+                            "Yes → Step ID", min_value=1, required=False, width=_pick_width(yes_len)
+                        ),
+                        "no_step_id": st.column_config.NumberColumn(
+                            "No → Step ID", min_value=1, required=False, width=_pick_width(no_len)
+                        ),
+                    },
+                    hide_index=True,
+                )
+
+                if st.button("Save table changes", key=f"workflow_table_save_{workflow_id}"):
+                    if editor_df.empty:
+                        st.error("Add at least one step before saving.")
+                    else:
+                        try:
+                            original_ids = set(
+                                table_source["step_id"].dropna().astype(int).tolist()
+                            )
+                            edited_ids = set(
+                                editor_df["step_id"].dropna().astype(int).tolist()
+                            )
+                            to_delete = original_ids - edited_ids
+
+                            updates: Dict[int, Dict[str, object]] = {}
+                            inserts: List[Dict[str, object]] = []
+
+                            for row in editor_df.itertuples(index=False):
+                                step_id = row.step_id
+                                title_raw = row.title
+                                order_raw = row.step_order
+
+                                if not isinstance(title_raw, str) or not title_raw.strip():
+                                    raise ValueError("Every step must have a title.")
+                                if pd.isna(order_raw):
+                                    raise ValueError("Every step must have an order number.")
+
+                                yes_raw = row.yes_step_id
+                                no_raw = row.no_step_id
+
+                                yes_val = None if pd.isna(yes_raw) else int(yes_raw)
+                                no_val = None if pd.isna(no_raw) else int(no_raw)
+                                payload = {
+                                    "step_order": int(order_raw),
+                                    "title": title_raw.strip(),
+                                    "yes_step_id": yes_val,
+                                    "no_step_id": no_val,
+                                }
+
+                                if pd.isna(step_id):
+                                    inserts.append(payload)
+                                else:
+                                    updates[int(step_id)] = payload
+
+                            if to_delete:
+                                delete_workflow_steps(to_delete)
+
+                            if updates:
+                                update_workflow_steps(updates)
+
+                            workflow_id_int = int(workflow_id)
+                            for payload in inserts:
+                                insert_workflow_step(
+                                    workflow_id_int,
+                                    payload["step_order"],
+                                    payload["title"],
+                                    payload["yes_step_id"],
+                                    payload["no_step_id"],
+                                )
+
+                            clear_cached_workflows()
+                            st.success("Workflow table updated.")
+                            trigger_rerun()
+                        except ValueError as exc:
+                            st.error(str(exc))
+
+            with tab_barfi:
+                render_barfi_editor(expander_label, int(workflow_id))
 
 
 def render_add_topic() -> None:
@@ -1055,6 +1297,36 @@ def render_review() -> None:
 
 def main() -> None:
     st.set_page_config(page_title="Handover Tracker", layout="wide")
+    st.markdown(
+        """
+        <style>
+            :root {
+                font-size: 50px;
+            }
+            body, .block-container {
+                font-size: 2rem !important;
+            }
+            h1, h2, h3, h4, h5, h6 {
+                font-weight: 600;
+                line-height: 1.35;
+            }
+            .stMarkdown p,
+            .stMarkdown li,
+            div[data-testid="stMetricValue"],
+            div[data-testid="stMetricLabel"],
+            .stDataFrame,
+            label,
+            .stTextInput input,
+            .stTextArea textarea,
+            div[data-baseweb="select"],
+            button,
+            .stButton button {
+                font-size: 1.15rem !important;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     st.title("Handover planning dashboard")
     st.caption("Track conversations, owners, and next steps ahead of your transition.")
 
