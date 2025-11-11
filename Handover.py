@@ -1304,7 +1304,7 @@ def main() -> None:
                 font-size: 18px;
             }
             body, .block-container {
-                font-size: 2rem !important;
+                font-size: 1.1rem !important;
             }
             h1, h2, h3, h4, h5, h6 {
                 font-weight: 600;
