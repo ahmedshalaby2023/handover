@@ -20,7 +20,12 @@ try:  # Prefer xlsxwriter for richer formatting, otherwise fall back
 
     EXCEL_ENGINE = "xlsxwriter"
 except ImportError:  # pragma: no cover - platform dependent
-    EXCEL_ENGINE = "openpyxl"
+    try:
+        import openpyxl  # type: ignore  # noqa: F401
+
+        EXCEL_ENGINE = "openpyxl"
+    except ImportError:  # pragma: no cover - platform dependent
+        EXCEL_ENGINE = None
 
 
 DB_PATH = Path(__file__).with_name("handover_tracker.db")
@@ -81,6 +86,9 @@ def build_excel_report(df: pd.DataFrame) -> bytes:
     )
 
     buffer = io.BytesIO()
+    if EXCEL_ENGINE is None:
+        raise RuntimeError("No Excel writer engine available. Install xlsxwriter or openpyxl.")
+
     with pd.ExcelWriter(buffer, engine=EXCEL_ENGINE) as writer:
         export_df.to_excel(writer, index=False, sheet_name="Handover Register")
         if EXCEL_ENGINE == "xlsxwriter":
@@ -429,9 +437,21 @@ def render_review() -> None:
     )
 
     st.markdown("### 📤 Share & export")
-    col_csv, col_excel, col_summary = st.columns(3)
+    show_excel = EXCEL_ENGINE is not None
+    columns = 3 if show_excel else 2
+    layout = st.columns(columns)
 
-    excel_bytes = build_excel_report(df)
+    col_csv = layout[0]
+    col_summary = layout[-1]
+    excel_bytes = None
+
+    if show_excel:
+        col_excel = layout[1]
+        try:
+            excel_bytes = build_excel_report(df)
+        except RuntimeError:
+            show_excel = False
+
     summary_markdown = build_summary(df)
 
     with col_csv:
@@ -443,13 +463,19 @@ def render_review() -> None:
             use_container_width=True,
         )
 
-    with col_excel:
-        st.download_button(
-            label="📊 Excel report",
-            data=excel_bytes,
-            file_name="handover_report.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
+    if show_excel and excel_bytes:
+        with col_excel:  # type: ignore[name-defined]
+            st.download_button(
+                label="📊 Excel report",
+                data=excel_bytes,
+                file_name="handover_report.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+    elif not show_excel:
+        st.info(
+            "Install `xlsxwriter` or `openpyxl` to enable Excel exports.",
+            icon="ℹ️",
         )
 
     with col_summary:
