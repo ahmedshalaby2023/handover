@@ -3,11 +3,13 @@ from __future__ import annotations
 import datetime as dt
 import io
 import json
+import shutil
 import sqlite3
 import uuid
+from collections import defaultdict
 from pathlib import Path
 from urllib.parse import quote
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -16,6 +18,14 @@ try:  # Plotly is optional; degrade gracefully if unavailable
     import plotly.express as px  # type: ignore
 except ImportError:  # pragma: no cover - visual enhancement only
     px = None  # type: ignore[assignment]
+
+
+def _trigger_rerun() -> None:
+    """Trigger a Streamlit rerun, handling API differences across versions."""
+    if hasattr(st, "rerun"):
+        st.rerun()
+    elif hasattr(st, "experimental_rerun"):
+        st.experimental_rerun()
 
 try:  # Prefer xlsxwriter for richer formatting, otherwise fall back
     import xlsxwriter  # type: ignore  # noqa: F401
@@ -31,6 +41,7 @@ except ImportError:  # pragma: no cover - platform dependent
 
 
 DB_PATH = Path(__file__).with_name("handover_tracker.db")
+BACKUP_DIR = DB_PATH.with_name("handover_backups")
 STATUS_OPTIONS = ["Not Started", "In Progress", "Waiting", "Completed", "Archived"]
 STATUS_BADGES = {
     "Not Started": "🟥 Not Started",
@@ -39,6 +50,14 @@ STATUS_BADGES = {
     "Completed": "🟩 Completed",
     "Archived": "⬜ Archived",
 }
+
+STAKEHOLDER_SUPPORT_LEVELS = [
+    "Advocate",
+    "Neutral",
+    "Resistant",
+]
+
+STAKEHOLDER_SCALE = [1, 2, 3, 4, 5]
 
 STATUS_COLORS = {
     "Not Started": "#d62728",
@@ -162,17 +181,20 @@ def render_barfi_editor(workflow_label: str, workflow_id: int) -> None:
     )
 
 
-def build_graphviz_workflow(steps_df: pd.DataFrame, font_size: int = 26) -> Optional[str]:
+def build_graphviz_workflow(
+    steps_df: pd.DataFrame,
+    font_size: int = 26,
+    current_step_id: Optional[int] = None,
+) -> Optional[str]:
     if steps_df.empty:
         return None
 
     ordered = steps_df.sort_values("step_order")
     node_font = max(12, font_size)
-    font_scale = node_font / 22
     lines: List[str] = [
         "digraph Workflow {",
         "    rankdir=LR;",
-        '    graph [splines=ortho, nodesep=0.8, ranksep=1.1];',
+        '    graph [splines=ortho, nodesep=0.4, ranksep=0.75, margin="0.25,0.25"];',
         f'    node [shape=rectangle, style="rounded,filled", fontname="Helvetica", fontsize={node_font}, fillcolor="#F7FAFC", color="#4A5568", fontcolor="#1A202C", fixedsize=false];',
         '    edge [fontname="Helvetica", fontsize=22, color="#4A5568"];',
     ]
@@ -203,14 +225,28 @@ def build_graphviz_workflow(steps_df: pd.DataFrame, font_size: int = 26) -> Opti
         node_name = node_id(step_id)
         wrapped_title = _wrap_title(row.step_title.strip())
         title = f"Step {int(row.step_order)}: {wrapped_title}"
-        width = _estimate_node_width(title) * font_scale
         label = _graphviz_label(title)
         is_decision = bool(getattr(row, "no_step_id", None) and not pd.isna(row.no_step_id))
         shape = "diamond" if is_decision else "rectangle"
         border_color = "#4A5568"
-        lines.append(
-            f'    {node_name} [label="{label}", shape={shape}, color="{border_color}", penwidth=2, fontsize={node_font}, width={width:.2f}];'
-        )
+        highlight = current_step_id is not None and step_id == current_step_id
+        node_attrs = [
+            f"label=\"{label}\"",
+            f"shape={shape}",
+            f"color=\"{border_color}\"",
+            "penwidth=2",
+            f"fontsize={node_font}",
+        ]
+        if highlight:
+            node_attrs.extend(
+                [
+                    "style=\"rounded,filled\"",
+                    "fillcolor=\"#FFF3BF\"",
+                    "color=\"#F59E0B\"",
+                    "penwidth=3",
+                ]
+            )
+        lines.append(f"    {node_name} [{', '.join(node_attrs)}];")
 
         step_order_val = int(row.step_order)
         existing_nodes[step_id] = node_name
@@ -239,7 +275,7 @@ def build_graphviz_workflow(steps_df: pd.DataFrame, font_size: int = 26) -> Opti
 
             if len(nodes_in_row) > 1:
                 for left, right in zip(nodes_in_row, nodes_in_row[1:]):
-                    lines.append(f"    {left} -> {right} [style=invis, weight=5];")
+                    lines.append(f"    {left} -> {right} [style=invis, weight=1];")
 
         lines.append("    { rank=source; start; }")
         lines.append("    { rank=sink; finish; }")
@@ -289,6 +325,7 @@ def build_graphviz_workflow(steps_df: pd.DataFrame, font_size: int = 26) -> Opti
                 elif label_text.lower() == "no":
                     attrs.append('color="#C53030"')
                     attrs.append('fontcolor="#C53030"')
+                    attrs.append('labelfloat=true')
                     attrs.append('style="dotted"')
             if target_order is not None and target_order < int(row.step_order):
                 attrs.append('constraint=false')
@@ -368,32 +405,332 @@ def _ensure_workflow_step_branch_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE workflow_steps ADD COLUMN no_step_id INTEGER")
 
 
-def init_db() -> None:
-    """Ensure the handover table exists."""
+def _ensure_topic_photo_column(conn: sqlite3.Connection) -> None:
+    existing_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info('handover_topics')")
+    }
+    if "photo" not in existing_columns:
+        conn.execute("ALTER TABLE handover_topics ADD COLUMN photo BLOB")
+
+
+def ensure_topic_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS handover_topics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            person TEXT NOT NULL,
+            topic TEXT NOT NULL,
+            meeting_date TEXT NOT NULL,
+            details TEXT,
+            status TEXT NOT NULL,
+            next_steps TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            photo BLOB
+        )
+        """
+    )
+    _ensure_topic_photo_column(conn)
+
+
+def ensure_stakeholder_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS stakeholders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            position TEXT,
+            department TEXT,
+            role_description TEXT,
+            influence INTEGER NOT NULL,
+            interest INTEGER NOT NULL,
+            power INTEGER NOT NULL,
+            support_level TEXT NOT NULL,
+            notes TEXT,
+            contact_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (contact_id) REFERENCES contacts(id) ON DELETE SET NULL
+        )
+        """
+    )
+
+
+def _ensure_stakeholder_columns(conn: sqlite3.Connection) -> None:
+    ensure_stakeholder_schema(conn)
+    existing_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info('stakeholders')")
+    }
+    if "contact_id" not in existing_columns:
+        conn.execute("ALTER TABLE stakeholders ADD COLUMN contact_id INTEGER")
+        existing_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info('stakeholders')")
+        }
+    expected = {
+        "name",
+        "position",
+        "department",
+        "role_description",
+        "influence",
+        "interest",
+        "power",
+        "support_level",
+        "notes",
+        "contact_id",
+        "created_at",
+        "updated_at",
+    }
+    missing = expected - existing_columns
+    if missing:
+        raise RuntimeError(
+            "Stakeholder table is missing expected columns: " + ", ".join(sorted(missing))
+        )
+
+
+def ensure_contact_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS contacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            full_name TEXT NOT NULL,
+            title TEXT,
+            department TEXT,
+            email TEXT,
+            phone TEXT,
+            location TEXT,
+            manager_id INTEGER,
+            notes TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (manager_id) REFERENCES contacts(id) ON DELETE SET NULL
+        )
+        """
+    )
+
+
+def _init_db_impl() -> None:
+    """Ensure the handover and workflow tables exist."""
 
     with get_connection() as conn:
+        ensure_topic_schema(conn)
+        ensure_stakeholder_schema(conn)
+        _ensure_stakeholder_columns(conn)
+        ensure_contact_schema(conn)
+        ensure_workflow_tables(conn)
+        conn.commit()
+
+
+def init_db() -> None:
+    """Ensure core database structures are ready for use."""
+
+    _init_db_impl()
+
+
+def add_stakeholder(
+    name: str,
+    position: str,
+    department: str,
+    role_description: str,
+    influence: int,
+    interest: int,
+    power: int,
+    support_level: str,
+    notes: str = "",
+    contact_id: Optional[int] = None,
+) -> None:
+    now_iso = dt.datetime.utcnow().isoformat(timespec="seconds")
+    payload = (
+        name.strip(),
+        position.strip(),
+        department.strip(),
+        role_description.strip(),
+        int(influence),
+        int(interest),
+        int(power),
+        support_level,
+        notes.strip(),
+        int(contact_id) if contact_id is not None else None,
+        now_iso,
+        now_iso,
+    )
+
+    with get_connection() as conn:
+        _ensure_stakeholder_columns(conn)
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS handover_topics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                person TEXT NOT NULL,
-                topic TEXT NOT NULL,
-                meeting_date TEXT NOT NULL,
-                details TEXT,
-                status TEXT NOT NULL,
-                next_steps TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
+            INSERT INTO stakeholders (
+                name, position, department, role_description, influence, interest, power,
+                support_level, notes, contact_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            payload,
         )
-        ensure_workflow_tables(conn)
+
+
+def update_stakeholder(stakeholder_id: int, updates: Dict[str, Any]) -> None:
+    if not updates:
+        return
+
+    set_parts: List[str] = []
+    bindings: List[Any] = []
+
+    for column, value in updates.items():
+        set_parts.append(f"{column} = ?")
+        bindings.append(value)
+
+    set_parts.append("updated_at = ?")
+    bindings.append(dt.datetime.utcnow().isoformat(timespec="seconds"))
+    bindings.append(stakeholder_id)
+
+    with get_connection() as conn:
+        _ensure_stakeholder_columns(conn)
+        conn.execute(
+            f"UPDATE stakeholders SET {', '.join(set_parts)} WHERE id = ?",
+            bindings,
+        )
+
+
+def delete_stakeholders(stakeholder_ids: Iterable[int]) -> None:
+    ids = [int(sid) for sid in stakeholder_ids]
+    if not ids:
+        return
+
+    placeholders = ",".join("?" for _ in ids)
+    with get_connection() as conn:
+        _ensure_stakeholder_columns(conn)
+        conn.execute(
+            f"DELETE FROM stakeholders WHERE id IN ({placeholders})",
+            ids,
+        )
+
+
+def fetch_stakeholders() -> pd.DataFrame:
+    with get_connection() as conn:
+        _ensure_stakeholder_columns(conn)
+        df = pd.read_sql_query(
+            "SELECT * FROM stakeholders ORDER BY name COLLATE NOCASE",
+            conn,
+        )
+
+    if not df.empty:
+        df["created_at"] = pd.to_datetime(df["created_at"])
+        df["updated_at"] = pd.to_datetime(df["updated_at"])
+        if "contact_id" in df.columns:
+            df["contact_id"] = pd.to_numeric(df["contact_id"], errors="coerce").astype("Int64")
+
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def load_stakeholders() -> pd.DataFrame:
+    return fetch_stakeholders()
+
+
+def clear_cached_stakeholders() -> None:
+    load_stakeholders.clear()  # type: ignore[attr-defined]
+
+
+def add_contact(
+    full_name: str,
+    title: str,
+    department: str,
+    email: str,
+    phone: str,
+    location: str,
+    manager_id: Optional[int],
+    notes: str,
+) -> None:
+    now_iso = dt.datetime.utcnow().isoformat(timespec="seconds")
+    payload: Tuple[object, ...] = (
+        full_name.strip(),
+        title.strip(),
+        department.strip(),
+        email.strip(),
+        phone.strip(),
+        location.strip(),
+        int(manager_id) if manager_id is not None else None,
+        notes.strip(),
+        now_iso,
+        now_iso,
+    )
+
+    with get_connection() as conn:
+        ensure_contact_schema(conn)
+        conn.execute(
+            """
+            INSERT INTO contacts (
+                full_name, title, department, email, phone, location, manager_id, notes, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            payload,
+        )
+
+
+def update_contact(contact_id: int, updates: Dict[str, Any]) -> None:
+    if not updates:
+        return
+
+    set_parts: List[str] = []
+    bindings: List[Any] = []
+
+    for column, value in updates.items():
+        set_parts.append(f"{column} = ?")
+        bindings.append(value)
+
+    set_parts.append("updated_at = ?")
+    bindings.append(dt.datetime.utcnow().isoformat(timespec="seconds"))
+    bindings.append(contact_id)
+
+    with get_connection() as conn:
+        ensure_contact_schema(conn)
+        conn.execute(
+            f"UPDATE contacts SET {', '.join(set_parts)} WHERE id = ?",
+            bindings,
+        )
+
+
+def delete_contacts(contact_ids: Iterable[int]) -> None:
+    ids = [int(cid) for cid in contact_ids]
+    if not ids:
+        return
+
+    placeholders = ",".join("?" for _ in ids)
+    with get_connection() as conn:
+        ensure_contact_schema(conn)
+        conn.execute(
+            f"DELETE FROM contacts WHERE id IN ({placeholders})",
+            ids,
+        )
+
+
+def fetch_contacts() -> pd.DataFrame:
+    with get_connection() as conn:
+        ensure_contact_schema(conn)
+        df = pd.read_sql_query(
+            "SELECT * FROM contacts ORDER BY full_name COLLATE NOCASE",
+            conn,
+        )
+
+    if not df.empty:
+        df["created_at"] = pd.to_datetime(df["created_at"])
+        df["updated_at"] = pd.to_datetime(df["updated_at"])
+
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def load_contacts() -> pd.DataFrame:
+    return fetch_contacts()
+
+
+def clear_cached_contacts() -> None:
+    load_contacts.clear()  # type: ignore[attr-defined]
 
 
 def build_excel_report(df: pd.DataFrame) -> bytes:
     """Generate an Excel workbook with handover data."""
 
-    export_df = df.copy()
+    export_df = df.drop(columns=["photo"], errors="ignore").copy()
     export_df["Meeting Date"] = export_df["meeting_date"].apply(lambda d: d.strftime("%d %b %Y"))
     export_df["Status"] = export_df["status"].apply(status_badge)
     export_df["Created"] = export_df["created_at"].dt.strftime("%d %b %Y %H:%M")
@@ -454,9 +791,11 @@ def build_summary(df: pd.DataFrame) -> str:
     upcoming_window = dt.date.today() + dt.timedelta(days=7)
     upcoming = int((df["meeting_date"] <= upcoming_window).sum())
 
+    summary_source = df.drop(columns=["photo"], errors="ignore")
+
     summary_lines = [
         "# Handover summary",
-        f"- Total topics: {total}",
+        f"- Total topics: {len(summary_source)}",
         f"- Completed: {completed}",
         f"- In progress: {in_progress}",
         f"- Waiting on others: {waiting}",
@@ -524,6 +863,7 @@ def add_topic(
     details: str,
     status: str,
     next_steps: str,
+    photo: Optional[bytes] = None,
 ) -> None:
     now_iso = dt.datetime.utcnow().isoformat(timespec="seconds")
     payload = (
@@ -535,14 +875,16 @@ def add_topic(
         next_steps.strip(),
         now_iso,
         now_iso,
+        photo,
     )
 
     with get_connection() as conn:
+        ensure_topic_schema(conn)
         conn.execute(
             """
             INSERT INTO handover_topics (
-                person, topic, meeting_date, details, status, next_steps, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                person, topic, meeting_date, details, status, next_steps, created_at, updated_at, photo
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             payload,
         )
@@ -550,11 +892,11 @@ def add_topic(
 
 def update_topic(
     topic_id: int,
-    updates: Dict[str, str],
+    updates: Dict[str, Any],
     meeting_date: Optional[dt.date] = None,
 ) -> None:
     set_parts: list[str] = []
-    bindings: list[str] = []
+    bindings: List[Any] = []
 
     for column, value in updates.items():
         set_parts.append(f"{column} = ?")
@@ -569,6 +911,7 @@ def update_topic(
     bindings.append(topic_id)
 
     with get_connection() as conn:
+        ensure_topic_schema(conn)
         conn.execute(
             f"UPDATE handover_topics SET {' ,'.join(set_parts)} WHERE id = ?",
             bindings,
@@ -597,6 +940,7 @@ def fetch_topics(filters: Optional[Dict[str, Iterable[str]]] = None) -> pd.DataF
     query += " ORDER BY meeting_date ASC"
 
     with get_connection() as conn:
+        ensure_topic_schema(conn)
         df = pd.read_sql_query(query, conn, params=params)
 
     if not df.empty:
@@ -739,6 +1083,54 @@ def clear_cached_workflows() -> None:
     load_workflows.clear()  # type: ignore[attr-defined]
 
 
+def ensure_backup_directory() -> Path:
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    return BACKUP_DIR
+
+
+def _backup_filename(timestamp: dt.datetime) -> str:
+    return f"handover_backup_{timestamp.strftime('%Y%m%d_%H%M%S')}.db"
+
+
+def _parse_backup_timestamp(path: Path) -> Optional[dt.datetime]:
+    stem = path.stem
+    prefix = "handover_backup_"
+    if not stem.startswith(prefix):
+        return None
+    raw = stem[len(prefix) :]
+    try:
+        return dt.datetime.strptime(raw, "%Y%m%d_%H%M%S")
+    except ValueError:
+        return None
+
+
+def list_database_backups() -> List[Path]:
+    if not BACKUP_DIR.exists():
+        return []
+    return sorted(BACKUP_DIR.glob("handover_backup_*.db"), reverse=True)
+
+
+def create_database_backup() -> Path:
+    ensure_backup_directory()
+    init_db()
+    timestamp = dt.datetime.utcnow()
+    backup_path = BACKUP_DIR / _backup_filename(timestamp)
+    shutil.copy2(DB_PATH, backup_path)
+    return backup_path
+
+
+def restore_database_backup(backup_path: Path) -> None:
+    if not backup_path.exists() or not backup_path.is_file():
+        raise FileNotFoundError(f"Backup not found: {backup_path}")
+
+    shutil.copy2(backup_path, DB_PATH)
+    init_db()
+    clear_cached_topics()
+    clear_cached_contacts()
+    clear_cached_stakeholders()
+    clear_cached_workflows()
+
+
 def trigger_rerun() -> None:
     rerun = getattr(st, "rerun", None)
     if callable(rerun):
@@ -872,8 +1264,12 @@ def delete_workflow_process(workflow_id: int) -> None:
             init_db()
 
 
-def render_workflow_diagram(steps_df: pd.DataFrame, font_size: int) -> None:
-    graphviz_code = build_graphviz_workflow(steps_df, font_size=font_size)
+def render_workflow_diagram(steps_df: pd.DataFrame, font_size: int, current_step_id: Optional[int]) -> None:
+    graphviz_code = build_graphviz_workflow(
+        steps_df,
+        font_size=font_size,
+        current_step_id=current_step_id,
+    )
     if graphviz_code:
         st.graphviz_chart(graphviz_code, use_container_width=True)
 
@@ -946,23 +1342,43 @@ def render_workflows() -> None:
         else:
             st.info("No workflows available to delete.")
 
-    st.session_state.setdefault("workflow_font_size", 26)
+    if "workflow_font_size" not in st.session_state:
+        st.session_state["workflow_font_size"] = 26
+    if "workflow_font_input" not in st.session_state:
+        st.session_state["workflow_font_input"] = str(st.session_state["workflow_font_size"])
+    if st.session_state.pop("workflow_font_reset_pending", False):
+        st.session_state["workflow_font_size"] = 26
+        st.session_state["workflow_font_input"] = "26"
 
-    font_col, _, reset_col = st.columns([2, 3, 1])
+    font_col, reset_col = st.columns([3, 1])
     with font_col:
-        st.caption("Workflow diagram font size")
-        cols = st.columns([1, 1, 2])
-        with cols[0]:
-            if st.button("−", key="workflow_font_minus"):
-                st.session_state["workflow_font_size"] = max(12, st.session_state["workflow_font_size"] - 2)
-        with cols[1]:
-            if st.button("+", key="workflow_font_plus"):
-                st.session_state["workflow_font_size"] = min(60, st.session_state["workflow_font_size"] + 2)
-        with cols[2]:
-            st.write(f"**{st.session_state['workflow_font_size']} pt**")
+        st.caption("Workflow diagram font size (12–60 pt)")
+        font_input = st.text_input(
+            "Font size (pt)",
+            key="workflow_font_input",
+            help="Type a number between 12 and 60 to adjust the workflow diagram font size.",
+        )
+
+        current_size = st.session_state["workflow_font_size"]
+        font_input_str = font_input.strip()
+        if font_input_str:
+            try:
+                parsed_size = int(float(font_input_str))
+            except ValueError:
+                st.warning("Enter a numeric font size, e.g., 24.")
+            else:
+                if 12 <= parsed_size <= 60:
+                    if parsed_size != current_size:
+                        st.session_state["workflow_font_size"] = parsed_size
+                else:
+                    st.warning("Font size must be between 12 and 60 pt.")
+
+        st.write(f"**Current: {st.session_state['workflow_font_size']} pt**")
+
     with reset_col:
         if st.button("Reset", key="workflow_font_reset"):
-            st.session_state["workflow_font_size"] = 26
+            st.session_state["workflow_font_reset_pending"] = True
+            _trigger_rerun()
 
     font_size = st.session_state["workflow_font_size"]
 
@@ -994,10 +1410,50 @@ def render_workflows() -> None:
             ])
 
             with tab_visual:
+                state_key_current = f"workflow_current_step_{workflow_id}"
+                state_key_source = f"workflow_current_source_{workflow_id}"
+                if state_key_current not in st.session_state:
+                    st.session_state[state_key_current] = None
+                if state_key_source not in st.session_state:
+                    st.session_state[state_key_source] = "diagram"
+
+                current_step_id = st.session_state[state_key_current]
+
+                ordered_steps = steps_df.sort_values("step_order") if not steps_df.empty else pd.DataFrame()
+                step_options = (
+                    ordered_steps["step_id"].dropna().astype(int).tolist()
+                    if not ordered_steps.empty
+                    else []
+                )
+
+                if step_options:
+                    display_options = {
+                        int(step_id): f"Step {int(step_order)}"
+                        for step_id, step_order in zip(
+                            ordered_steps["step_id"],
+                            ordered_steps["step_order"],
+                        )
+                    }
+                    selected_option = st.selectbox(
+                        "Highlight step",
+                        options=[None] + step_options,
+                        index=(step_options.index(current_step_id) + 1) if current_step_id in step_options else 0,
+                        format_func=lambda opt: "— None —" if opt is None else display_options.get(int(opt), str(opt)),
+                        key=f"workflow_step_select_{workflow_id}",
+                    )
+                    st.session_state[state_key_current] = selected_option
+                    st.session_state[state_key_source] = "selectbox"
+                elif steps_df.empty:
+                    st.caption("Add steps to enable highlighting.")
+
                 if steps_df.empty:
                     st.info("No steps logged for this workflow yet. Use the table below to add steps.")
                 else:
-                    render_workflow_diagram(steps_df, font_size=font_size)
+                    render_workflow_diagram(
+                        steps_df,
+                        font_size=font_size,
+                        current_step_id=current_step_id,
+                    )
 
                 base_columns = ["step_id", "step_order", "step_title", "yes_step_id", "no_step_id"]
                 if steps_df.empty:
@@ -1125,6 +1581,8 @@ def render_workflows() -> None:
 
                             clear_cached_workflows()
                             st.success("Workflow table updated.")
+                            st.session_state[state_key_source] = "table"
+                            st.session_state[state_key_current] = None
                             trigger_rerun()
                         except ValueError as exc:
                             st.error(str(exc))
@@ -1156,15 +1614,412 @@ def render_add_topic() -> None:
             "Next steps / notes",
             placeholder="Follow-up tasks, documents to share, risks, etc.",
         )
+        photo_capture = st.camera_input(
+            "Capture photo (optional)",
+            key="add_topic_camera",
+            help="Use your webcam to snap a quick reference photo.",
+        )
+        photo_upload = st.file_uploader(
+            "Or upload an image",
+            type=["png", "jpg", "jpeg"],
+            accept_multiple_files=False,
+            key="add_topic_photo_upload",
+        )
 
         submitted = st.form_submit_button("Save topic", type="primary")
         if submitted:
             if not person.strip() or not topic.strip():
                 st.error("Person and topic are required.")
             else:
-                add_topic(person, topic, meeting_date, details, status, next_steps)
+                photo_bytes: Optional[bytes] = None
+                if photo_capture is not None:
+                    photo_bytes = photo_capture.getvalue()
+                elif photo_upload is not None:
+                    photo_bytes = photo_upload.getvalue()
+
+                add_topic(person, topic, meeting_date, details, status, next_steps, photo=photo_bytes)
                 clear_cached_topics()
                 st.success("Topic saved and ready for review.")
+                st.experimental_rerun()
+
+
+def _contact_select_options(df: pd.DataFrame) -> Dict[str, int]:
+    return {
+        f"#{int(row.id)} · {row.full_name} ({row.title or 'No title'})": int(row.id)
+        for row in df.itertuples()
+    }
+
+
+def build_contacts_org_graph(
+    all_contacts: pd.DataFrame,
+    filtered: pd.DataFrame,
+    font_size: int = 16,
+) -> Optional[str]:
+    if filtered.empty:
+        return None
+
+    required_columns = {"id", "full_name", "title", "manager_id"}
+    if not required_columns.issubset(all_contacts.columns):
+        return None
+
+    def _safe_int(value: object) -> Optional[int]:
+        try:
+            if pd.isna(value):
+                return None
+        except TypeError:
+            pass
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    id_to_row: Dict[int, pd.Series] = {}
+    for row in all_contacts.itertuples(index=False):
+        contact_id = _safe_int(getattr(row, "id", None))
+        if contact_id is None:
+            continue
+        id_to_row[contact_id] = pd.Series(row._asdict())
+
+    display_ids: Set[int] = set()
+    queue: List[int] = []
+
+    for row in filtered.itertuples(index=False):
+        contact_id = _safe_int(getattr(row, "id", None))
+        if contact_id is None:
+            continue
+        display_ids.add(contact_id)
+        queue.append(contact_id)
+
+    while queue:
+        current_id = queue.pop()
+        row = id_to_row.get(current_id)
+        if row is None:
+            continue
+        manager_id = _safe_int(row.get("manager_id"))
+        if manager_id is None or manager_id in display_ids:
+            continue
+        if manager_id in id_to_row:
+            display_ids.add(manager_id)
+            queue.append(manager_id)
+
+    if not display_ids:
+        return None
+
+    graph_lines = [
+        "digraph OrgStructure {",
+        "    rankdir=TB;",
+        '    graph [splines=ortho, nodesep=0.6, ranksep=0.9, margin="0.3,0.3"];',
+        '    node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize={}, fillcolor="#EDF2F7", color="#2D3748", fontcolor="#1A202C"];'.format(font_size),
+        '    edge [color="#4A5568", arrowhead=normal];',
+    ]
+
+    filtered_ids = {int(idx) for idx in display_ids if idx in filtered.set_index("id").index}
+
+    for contact_id in sorted(display_ids):
+        row = id_to_row.get(contact_id)
+        if row is None:
+            continue
+        name = str(row.get("full_name", "Unnamed"))
+        title = str(row.get("title", "") or "")
+        label_parts = [name.strip() or "Unnamed"]
+        if title:
+            label_parts.append(title.strip())
+        label = "\n".join(label_parts).replace("\n\n", "\n")
+        fill = "#E9D8FD" if contact_id in filtered_ids else "#EDF2F7"
+        safe_label = label.replace("\"", "\\\"")
+        graph_lines.append(
+            f'    "node_{contact_id}" [label="{safe_label}", fillcolor="{fill}"];'
+        )
+
+    for contact_id in display_ids:
+        row = id_to_row.get(contact_id)
+        if row is None:
+            continue
+        manager_id = _safe_int(row.get("manager_id"))
+        if manager_id is None or manager_id not in display_ids:
+            continue
+        graph_lines.append(f'    "node_{manager_id}" -> "node_{contact_id}";')
+
+    graph_lines.append("}")
+    return "\n".join(graph_lines)
+
+
+def render_contacts_org_chart(all_contacts: pd.DataFrame, filtered: pd.DataFrame) -> None:
+    graphviz_code = build_contacts_org_graph(all_contacts, filtered)
+    if graphviz_code is None:
+        st.info("Not enough hierarchy data to render the org chart.")
+        return
+
+    font_size = st.slider(
+        "Org chart font size",
+        min_value=10,
+        max_value=26,
+        value=16,
+        help="Adjust label readability in the organization chart.",
+    )
+    adjusted_graph = build_contacts_org_graph(all_contacts, filtered, font_size=font_size)
+    if adjusted_graph is None:
+        st.info("No contacts available to chart after applying filters.")
+        return
+
+    st.graphviz_chart(adjusted_graph, use_container_width=True)
+
+
+def render_contacts() -> None:
+    st.subheader("📇 Contact book & org directory")
+
+    contacts_df = load_contacts()
+
+    manager_options = {"— None —": None}
+    manager_options.update(_contact_select_options(contacts_df))
+
+    with st.form("add_contact_form", clear_on_submit=True):
+        full_name = st.text_input("Full name", placeholder="e.g., Sara Abdallah")
+        col_title, col_department = st.columns(2)
+        with col_title:
+            title = st.text_input("Title", placeholder="e.g., BI Manager")
+        with col_department:
+            department = st.text_input("Department", placeholder="e.g., Business Intelligence")
+        col_email, col_phone = st.columns(2)
+        with col_email:
+            email = st.text_input("Email", placeholder="name@example.com")
+        with col_phone:
+            phone = st.text_input("Phone", placeholder="+966 5 5555 5555")
+        location = st.text_input("Location", placeholder="Headquarters / Remote")
+        manager_label = st.selectbox("Manager", options=list(manager_options.keys()))
+        manager_id = manager_options[manager_label]
+        notes = st.text_area(
+            "Notes",
+            placeholder="Availability hours, preferred channels, responsibilities...",
+        )
+
+        submitted = st.form_submit_button("Add contact", type="primary")
+
+    if submitted:
+        if not full_name.strip():
+            st.error("Full name is required.")
+        else:
+            add_contact(
+                full_name,
+                title,
+                department,
+                email,
+                phone,
+                location,
+                manager_id,
+                notes,
+            )
+            clear_cached_contacts()
+            st.success("Contact added to the directory.")
+            contacts_df = load_contacts()
+            manager_options = {"— None —": None}
+            manager_options.update(_contact_select_options(contacts_df))
+
+    if contacts_df.empty:
+        st.info("No contacts captured yet. Use the form above to add your first entry.")
+        return
+
+    with st.expander("Filters", expanded=False):
+        departments = sorted(
+            {
+                str(dep).strip()
+                for dep in contacts_df["department"].dropna()
+                if str(dep).strip()
+            }
+        )
+        locations = sorted(
+            {
+                str(loc).strip()
+                for loc in contacts_df["location"].dropna()
+                if str(loc).strip()
+            }
+        )
+        selected_departments = st.multiselect("Departments", options=departments)
+        selected_locations = st.multiselect("Locations", options=locations)
+        show_with_manager = st.checkbox("Only contacts with a manager assigned", value=False)
+
+    filtered = contacts_df.copy()
+    if selected_departments:
+        filtered = filtered[filtered["department"].isin(selected_departments)]
+    if selected_locations:
+        filtered = filtered[filtered["location"].isin(selected_locations)]
+    if show_with_manager:
+        filtered = filtered[filtered["manager_id"].notna()]
+
+    st.markdown("### Directory")
+    display_df = filtered.copy()
+    manager_lookup = contacts_df.set_index("id")["full_name"].to_dict()
+    display_df["manager_name"] = display_df["manager_id"].map(manager_lookup)
+    display_df["created_at"] = display_df["created_at"].dt.strftime("%d %b %Y %H:%M")
+    display_df["updated_at"] = display_df["updated_at"].dt.strftime("%d %b %Y %H:%M")
+    st.dataframe(
+        display_df[
+            [
+                "full_name",
+                "title",
+                "department",
+                "email",
+                "phone",
+                "location",
+                "manager_name",
+                "notes",
+                "updated_at",
+            ]
+        ],
+        use_container_width=True,
+    )
+
+    csv = display_df.to_csv(index=False)
+    st.download_button(
+        label="⬇️ Download contacts CSV",
+        data=csv,
+        file_name="contacts.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    st.markdown("### Organization structure")
+    if filtered.empty:
+        st.info("Add contacts (and assign managers) to display the org chart.")
+    else:
+        render_contacts_org_chart(contacts_df, filtered)
+
+    st.markdown("### Edit or remove")
+    options = _contact_select_options(contacts_df)
+    if not options:
+        st.info("No contacts to edit.")
+        return
+
+    selection = st.selectbox("Select a contact", options=list(options.keys()))
+    contact_id = options[selection]
+    target = contacts_df.loc[contacts_df["id"] == contact_id]
+    if target.empty:
+        st.warning("Contact not found; try refreshing.")
+        return
+
+    record = target.iloc[0]
+
+    manager_picker_options = {"— None —": None}
+    manager_picker_options.update(
+        {
+            label: cid
+            for label, cid in _contact_select_options(contacts_df).items()
+            if cid != contact_id
+        }
+    )
+    default_manager_label = next(
+        (label for label, cid in manager_picker_options.items() if cid == record.get("manager_id")),
+        "— None —",
+    )
+
+    with st.form(f"update_contact_form_{contact_id}"):
+        upd_full_name = st.text_input("Full name", value=record.get("full_name", ""))
+        col_title, col_department = st.columns(2)
+        with col_title:
+            upd_title = st.text_input("Title", value=record.get("title", "") or "")
+        with col_department:
+            upd_department = st.text_input("Department", value=record.get("department", "") or "")
+        col_email, col_phone = st.columns(2)
+        with col_email:
+            upd_email = st.text_input("Email", value=record.get("email", "") or "")
+        with col_phone:
+            upd_phone = st.text_input("Phone", value=record.get("phone", "") or "")
+        upd_location = st.text_input("Location", value=record.get("location", "") or "")
+        upd_manager_label = st.selectbox(
+            "Manager",
+            options=list(manager_picker_options.keys()),
+            index=list(manager_picker_options.keys()).index(default_manager_label)
+            if default_manager_label in manager_picker_options
+            else 0,
+        )
+        upd_manager_id = manager_picker_options[upd_manager_label]
+        upd_notes = st.text_area("Notes", value=record.get("notes", "") or "")
+
+        save_changes = st.form_submit_button("Save changes", type="primary")
+
+    if save_changes:
+        if not upd_full_name.strip():
+            st.error("Full name cannot be empty.")
+        else:
+            update_payload = {
+                "full_name": upd_full_name.strip(),
+                "title": upd_title.strip(),
+                "department": upd_department.strip(),
+                "email": upd_email.strip(),
+                "phone": upd_phone.strip(),
+                "location": upd_location.strip(),
+                "manager_id": upd_manager_id,
+                "notes": upd_notes.strip(),
+            }
+            update_contact(contact_id, update_payload)
+            clear_cached_contacts()
+            st.success("Contact updated.")
+
+    if st.button("🗑️ Remove selected contacts", type="secondary"):
+        delete_contacts(selected_ids)
+        clear_cached_contacts()
+        st.success("Selected contacts removed.")
+        st.experimental_rerun()
+
+
+def render_backups() -> None:
+    st.subheader("🗃️ Database backups")
+
+    ensure_backup_directory()
+    backups = list_database_backups()
+
+    st.markdown(
+        "Create dated snapshots of your data before big changes, or restore a previous copy if needed."
+    )
+
+    col_backup, col_refresh = st.columns([3, 1])
+    with col_backup:
+        if st.button("💾 Create backup", type="primary"):
+            backup_path = create_database_backup()
+            st.success(f"Backup created: {backup_path.name}")
+            backups = list_database_backups()
+    with col_refresh:
+        if st.button("🔄 Refresh list"):
+            backups = list_database_backups()
+            st.info("Backup list refreshed.")
+
+    if not backups:
+        st.info("No backups found yet. Create your first snapshot to get started.")
+        return
+
+    options: List[Path] = []
+    human_labels: List[str] = []
+    for entry in backups:
+        timestamp = _parse_backup_timestamp(entry)
+        human = timestamp.strftime("%d %b %Y · %H:%M") if timestamp else entry.name
+        options.append(entry)
+        human_labels.append(f"{human} ({entry.name})")
+
+    selected_index = st.selectbox(
+        "Available backups",
+        options=range(len(options)),
+        format_func=lambda idx: human_labels[idx],
+    )
+    selected_backup = options[selected_index]
+
+    st.caption(f"Selected file: {selected_backup}")
+
+    st.divider()
+    st.markdown("### Restore backup")
+    confirm = st.checkbox(
+        "I understand restoring will overwrite the current database with the selected backup.",
+        value=False,
+    )
+    if st.button("⏪ Restore selected backup", type="primary", disabled=not confirm):
+        try:
+            restore_database_backup(selected_backup)
+        except FileNotFoundError:
+            st.error("Backup file no longer exists. Refresh the list and try again.")
+        except Exception as exc:
+            st.error(f"Failed to restore backup: {exc}")
+        else:
+            st.success("Backup restored. The app will refresh to show the restored data.")
+            trigger_rerun()
 
 
 def render_metrics(df: pd.DataFrame) -> None:
@@ -1215,6 +2070,7 @@ def render_review() -> None:
         )
 
     df = load_topics({"person": selected_persons, "status": selected_statuses})
+    df_display = df.drop(columns=["photo"], errors="ignore")
 
     if df.empty:
         st.info("No topics logged yet. Use the form above to add your first entry.")
@@ -1261,15 +2117,15 @@ def render_review() -> None:
 
     st.markdown("### 📁 Handover register")
     st.dataframe(
-        df.assign(
-            meeting_date=df["meeting_date"].apply(lambda d: d.strftime("%d %b %Y")),
-            created_at=df["created_at"].dt.strftime("%d %b %Y %H:%M"),
-            updated_at=df["updated_at"].dt.strftime("%d %b %Y %H:%M"),
+        df_display.assign(
+            meeting_date=df_display["meeting_date"].apply(lambda d: d.strftime("%d %b %Y")),
+            created_at=df_display["created_at"].dt.strftime("%d %b %Y %H:%M"),
+            updated_at=df_display["updated_at"].dt.strftime("%d %b %Y %H:%M"),
         ),
         use_container_width=True,
     )
 
-    csv = df.to_csv(index=False)
+    csv = df_display.to_csv(index=False)
     st.download_button(
         label="Download register (CSV)",
         data=csv,
@@ -1353,6 +2209,8 @@ def render_review() -> None:
         st.warning("Topic not found; it may have been removed.")
         return
 
+    existing_photo = selected_topic.get("photo") if isinstance(selected_topic, pd.Series) else None
+
     with st.form("update_topic_form"):
         new_person = st.text_input("Person responsible", value=selected_topic.person)
         new_topic = st.text_input("Topic", value=selected_topic.topic)
@@ -1372,6 +2230,36 @@ def render_review() -> None:
         new_details = st.text_area("Key details", value=selected_topic.details)
         new_next_steps = st.text_area("Next steps / notes", value=selected_topic.next_steps)
 
+        if existing_photo:
+            thumb_col, action_col = st.columns([1, 2])
+            with thumb_col:
+                st.image(
+                    io.BytesIO(existing_photo),
+                    caption="Current photo",
+                    width=120,
+                )
+            with action_col:
+                with st.popover("View full photo"):
+                    st.image(io.BytesIO(existing_photo), use_container_width=True)
+        photo_capture_update = st.camera_input(
+            "Update photo (optional)",
+            key=f"update_topic_camera_{topic_id}",
+            help="Capture a replacement photo for this record.",
+        )
+        photo_upload_update = st.file_uploader(
+            "Or upload a new image",
+            type=["png", "jpg", "jpeg"],
+            accept_multiple_files=False,
+            key=f"update_topic_photo_upload_{topic_id}",
+        )
+        remove_photo = False
+        if existing_photo is not None:
+            remove_photo = st.checkbox(
+                "Remove existing photo",
+                value=False,
+                help="Clear the stored image for this topic.",
+            )
+
         submitted = st.form_submit_button("Apply changes", type="primary")
 
     if submitted:
@@ -1382,26 +2270,376 @@ def render_review() -> None:
             "status": new_status,
             "next_steps": new_next_steps.strip(),
         }
+        photo_updated = False
+        photo_bytes: Optional[bytes] = None
+        if remove_photo:
+            photo_updated = True
+            photo_bytes = None
+        elif photo_capture_update is not None:
+            photo_updated = True
+            photo_bytes = photo_capture_update.getvalue()
+        elif photo_upload_update is not None:
+            photo_updated = True
+            photo_bytes = photo_upload_update.getvalue()
+
+        if photo_updated:
+            updates["photo"] = photo_bytes
+
         update_topic(topic_id, updates, meeting_date=new_meeting_date)
         clear_cached_topics()
         st.success("Topic updated.")
 
 
+def render_stakeholders() -> None:
+    st.subheader("🤝 Stakeholder analysis & management")
+
+    contacts_df = load_contacts()
+    contact_choices: Dict[str, Optional[int]] = {"— Manual entry —": None}
+    if not contacts_df.empty:
+        for row in contacts_df.itertuples():
+            label = f"{row.full_name} ({row.title or 'No title'})"
+            contact_choices[label] = int(row.id)
+
+    with st.form("add_stakeholder_form", clear_on_submit=True):
+        selected_contact_label = st.selectbox(
+            "Select from contacts",
+            options=list(contact_choices.keys()),
+            help="Pick an existing contact to auto-fill name/role, or choose manual entry.",
+        )
+        linked_contact_id = contact_choices[selected_contact_label]
+
+        if linked_contact_id is not None and not contacts_df.empty:
+            match = contacts_df.loc[contacts_df["id"] == linked_contact_id].iloc[0]
+            prefill_name = match.get("full_name", "")
+            prefill_position = match.get("title", "") or ""
+            prefill_department = match.get("department", "") or ""
+        else:
+            prefill_name = ""
+            prefill_position = ""
+            prefill_department = ""
+        name = st.text_input("Name", value=prefill_name, placeholder="e.g., Chief Operations Officer")
+        position = st.text_input("Role / position", value=prefill_position, placeholder="e.g., COO")
+        department = st.text_input("Department / team", value=prefill_department, placeholder="e.g., Operations")
+        role_description = st.text_area(
+            "Engagement role",
+            placeholder="Decision-maker, champion, subject-matter expert, etc.",
+        )
+        influence = st.slider(
+            "Influence (1 = low · 5 = high)",
+            min_value=1,
+            max_value=5,
+            value=4,
+        )
+        interest = st.slider(
+            "Interest (1 = low · 5 = high)",
+            min_value=1,
+            max_value=5,
+            value=4,
+        )
+        power = st.slider(
+            "Power (1 = low · 5 = high)",
+            min_value=1,
+            max_value=5,
+            value=4,
+        )
+        support_level = st.selectbox(
+            "Support level",
+            STAKEHOLDER_SUPPORT_LEVELS,
+            index=0,
+        )
+        notes = st.text_area(
+            "Notes",
+            placeholder="Key expectations, engagement tactics, meeting cadence...",
+        )
+
+        submitted = st.form_submit_button("Add stakeholder", type="primary")
+
+    if submitted:
+        if not name.strip():
+            st.error("Name is required.")
+        else:
+            add_stakeholder(
+                name,
+                position,
+                department,
+                role_description,
+                influence,
+                interest,
+                power,
+                support_level,
+                notes,
+                contact_id=linked_contact_id,
+            )
+            clear_cached_stakeholders()
+            st.success("Stakeholder added to the register.")
+
+    df = load_stakeholders()
+
+    if df.empty:
+        st.info("No stakeholders logged yet. Use the form above to add your first entry.")
+        return
+
+    with st.expander("Filters", expanded=False):
+        departments = sorted(
+            {
+                str(dep).strip()
+                for dep in df["department"].dropna()
+                if str(dep).strip()
+            }
+        )
+        support_levels = STAKEHOLDER_SUPPORT_LEVELS
+        selected_departments = st.multiselect("Departments", options=departments)
+        selected_support = st.multiselect(
+            "Support level",
+            options=support_levels,
+            default=[],
+        )
+        min_power, min_interest = st.columns(2)
+        with min_power:
+            min_power_value = st.slider(
+                "Minimum power",
+                min_value=1,
+                max_value=5,
+                value=1,
+            )
+        with min_interest:
+            min_interest_value = st.slider(
+                "Minimum interest",
+                min_value=1,
+                max_value=5,
+                value=1,
+            )
+
+    filtered = df.copy()
+    if selected_departments:
+        filtered = filtered[filtered["department"].isin(selected_departments)]
+    if selected_support:
+        filtered = filtered[filtered["support_level"].isin(selected_support)]
+    filtered = filtered[
+        (filtered["power"].fillna(0) >= min_power_value)
+        & (filtered["interest"].fillna(0) >= min_interest_value)
+    ]
+
+    if filtered.empty:
+        st.warning("No stakeholders match the current filters.")
+        return
+
+    col_total, col_advocates, col_resistant, col_high_power = st.columns(4)
+    col_total.metric("Total stakeholders", len(filtered))
+    col_advocates.metric(
+        "Advocates",
+        int((filtered["support_level"] == "Advocate").sum()),
+    )
+    col_resistant.metric(
+        "Resistant",
+        int((filtered["support_level"] == "Resistant").sum()),
+    )
+    col_high_power.metric(
+        "High-power (≥4)",
+        int((filtered["power"] >= 4).sum()),
+    )
+
+    if px is None:
+        st.info(
+            "Install `plotly` to see the power vs. interest bubble chart.",
+            icon="ℹ️",
+        )
+    else:
+        scatter_df = filtered.copy()
+        scatter_df["interest"] = scatter_df["interest"].astype(float)
+        scatter_df["power"] = scatter_df["power"].astype(float)
+        scatter_df["influence"] = scatter_df["influence"].astype(float)
+        fig = px.scatter(
+            scatter_df,
+            x="interest",
+            y="power",
+            size="influence",
+            color="support_level",
+            hover_data={
+                "name": True,
+                "position": True,
+                "department": True,
+                "role_description": True,
+                "support_level": True,
+                "interest": True,
+                "power": True,
+            },
+            size_max=40,
+            color_discrete_map={
+                "Advocate": "#38A169",
+                "Neutral": "#ECC94B",
+                "Resistant": "#E53E3E",
+            },
+            title="Power vs. interest map",
+        )
+        fig.update_layout(
+            xaxis=dict(title="Interest", range=[0.5, 5.5], dtick=1),
+            yaxis=dict(title="Power", range=[0.5, 5.5], dtick=1),
+            legend_title_text="Support level",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    display_df = filtered.copy()
+    if "contact_id" in display_df.columns and not contacts_df.empty:
+        contact_name_lookup = contacts_df.set_index("id")["full_name"].to_dict()
+        display_df["contact_name"] = display_df["contact_id"].map(contact_name_lookup)
+    display_df["created_at"] = display_df["created_at"].dt.strftime("%d %b %Y %H:%M")
+    display_df["updated_at"] = display_df["updated_at"].dt.strftime("%d %b %Y %H:%M")
+
+    st.markdown("### Stakeholder register")
+    st.dataframe(display_df, use_container_width=True)
+
+    csv = display_df.to_csv(index=False)
+    st.download_button(
+        label="⬇️ Download CSV",
+        data=csv,
+        file_name="stakeholders.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    options = {
+        f"#{row.id} · {row.name} ({row.position or 'No title'})": int(row.id)
+        for row in df.itertuples()
+    }
+
+    st.markdown("### Update or remove")
+    if not options:
+        st.info("No stakeholders available to edit.")
+        return
+
+    selection = st.selectbox("Select a stakeholder", options=list(options.keys()))
+    stakeholder_id = options[selection]
+    target = df.loc[df["id"] == stakeholder_id]
+    if target.empty:
+        st.warning("Stakeholder not found; try refreshing.")
+        return
+
+    record = target.iloc[0]
+
+    contact_update_choices: Dict[str, Optional[int]] = {"— Manual entry —": None}
+    if not contacts_df.empty:
+        for row in contacts_df.itertuples():
+            label = f"{row.full_name} ({row.title or 'No title'})"
+            contact_update_choices[label] = int(row.id)
+    current_contact_raw = record.get("contact_id")
+    current_contact_id: Optional[int]
+    if pd.isna(current_contact_raw):
+        current_contact_id = None
+    else:
+        try:
+            current_contact_id = int(current_contact_raw)
+        except (TypeError, ValueError):
+            current_contact_id = None
+    default_label = next(
+        (label for label, cid in contact_update_choices.items() if cid == current_contact_id),
+        "— Manual entry —",
+    )
+
+    with st.form(f"update_stakeholder_form_{stakeholder_id}"):
+        upd_name = st.text_input("Name", value=str(record["name"]))
+        upd_position = st.text_input("Role / position", value=record.get("position", "") or "")
+        upd_department = st.text_input("Department / team", value=record.get("department", "") or "")
+        upd_role_desc = st.text_area(
+            "Engagement role",
+            value=record.get("role_description", "") or "",
+        )
+        upd_influence = st.slider(
+            "Influence",
+            min_value=1,
+            max_value=5,
+            value=int(record.get("influence", 3) or 3),
+        )
+        upd_interest = st.slider(
+            "Interest",
+            min_value=1,
+            max_value=5,
+            value=int(record.get("interest", 3) or 3),
+        )
+        upd_power = st.slider(
+            "Power",
+            min_value=1,
+            max_value=5,
+            value=int(record.get("power", 3) or 3),
+        )
+        current_support = record.get("support_level", STAKEHOLDER_SUPPORT_LEVELS[0])
+        support_index = (
+            STAKEHOLDER_SUPPORT_LEVELS.index(current_support)
+            if current_support in STAKEHOLDER_SUPPORT_LEVELS
+            else 0
+        )
+        upd_support = st.selectbox(
+            "Support level",
+            STAKEHOLDER_SUPPORT_LEVELS,
+            index=support_index,
+        )
+        upd_notes = st.text_area("Notes", value=record.get("notes", "") or "")
+        upd_contact_label = st.selectbox(
+            "Linked contact",
+            options=list(contact_update_choices.keys()),
+            index=list(contact_update_choices.keys()).index(default_label)
+            if default_label in contact_update_choices
+            else 0,
+        )
+        upd_contact_id = contact_update_choices[upd_contact_label]
+
+        save_changes = st.form_submit_button("Save changes", type="primary")
+
+    if save_changes:
+        if not upd_name.strip():
+            st.error("Name cannot be empty.")
+        else:
+            update_stakeholder(
+                stakeholder_id,
+                {
+                    "name": upd_name.strip(),
+                    "position": upd_position.strip(),
+                    "department": upd_department.strip(),
+                    "role_description": upd_role_desc.strip(),
+                    "influence": int(upd_influence),
+                    "interest": int(upd_interest),
+                    "power": int(upd_power),
+                    "support_level": upd_support,
+                    "notes": upd_notes.strip(),
+                    "contact_id": upd_contact_id,
+                },
+            )
+            clear_cached_stakeholders()
+            st.success("Stakeholder updated.")
+
+    if st.button("🗑️ Delete selected stakeholder", type="secondary"):
+        delete_stakeholders([stakeholder_id])
+        clear_cached_stakeholders()
+        st.success("Stakeholder removed.")
+        st.experimental_rerun()
+
+
 def main() -> None:
     st.set_page_config(page_title="Handover Tracker", layout="wide")
+
+    ship_positions = {
+        "Contacts": -15,
+        "Add topic": 10,
+        "Review & update": 35,
+        "Workflow builder": 65,
+        "Stakeholders": 95,
+        "Backups": 120,
+    }
+    initial_ship_pos = ship_positions["Contacts"]
     st.markdown(
-        """
+        f"""
         <style>
-            :root {
+            :root {{
                 font-size: 18px;
-            }
-            body, .block-container {
+                --ship-pos: {initial_ship_pos}%;
+            }}
+            body, .block-container {{
                 font-size: 1.1rem !important;
-            }
-            h1, h2, h3, h4, h5, h6 {
+            }}
+            h1, h2, h3, h4, h5, h6 {{
                 font-weight: 600;
                 line-height: 1.35;
-            }
+            }}
             .stMarkdown p,
             .stMarkdown li,
             div[data-testid="stMetricValue"],
@@ -1412,21 +2650,168 @@ def main() -> None:
             .stTextArea textarea,
             div[data-baseweb="select"],
             button,
-            .stButton button {
+            .stButton button {{
                 font-size: 1.15rem !important;
-            }
+            }}
+            .ship-banner {{
+                position: relative;
+                width: 100%;
+                height: 80px;
+                overflow: hidden;
+                margin-bottom: 0.75rem;
+            }}
+            .ship-banner .ship-icon {{
+                position: absolute;
+                top: 8px;
+                left: 0;
+                transform: translateX(var(--ship-pos));
+                transition: transform 1.8s cubic-bezier(0.45, 0, 0.55, 1);
+                width: 140px;
+            }}
+            .ship-banner .island {{
+                position: absolute;
+                bottom: -4px;
+                right: 6%;
+                width: 170px;
+                animation: islandSway 5.5s ease-in-out infinite;
+            }}
+            @keyframes islandSway {{
+                0% {{
+                    transform: translateY(0);
+                }}
+                50% {{
+                    transform: translateY(-3px);
+                }}
+                100% {{
+                    transform: translateY(0);
+                }}
+            }}
         </style>
         """,
         unsafe_allow_html=True,
     )
-    st.title("Handover planning dashboard")
-    st.caption("Track conversations, owners, and next steps ahead of your transition.")
+    st.markdown(
+        """
+        <div class="ship-banner">
+            <div class="ship-icon">
+                <svg width="140" height="60" viewBox="0 0 140 60" xmlns="http://www.w3.org/2000/svg">
+                    <defs>
+                        <linearGradient id="hullGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+                            <stop offset="0%" stop-color="#2C5282" />
+                            <stop offset="100%" stop-color="#63B3ED" />
+                        </linearGradient>
+                        <linearGradient id="sailGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+                            <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.95" />
+                            <stop offset="100%" stop-color="#E2E8F0" stop-opacity="0.9" />
+                        </linearGradient>
+                    </defs>
+                    <rect x="10" y="40" width="120" height="12" rx="6" fill="url(#hullGradient)" />
+                    <polygon points="20,40 50,15 65,40" fill="url(#sailGradient)" stroke="#A0AEC0" stroke-width="1" />
+                    <polygon points="65,40 95,20 95,40" fill="url(#sailGradient)" stroke="#A0AEC0" stroke-width="1" />
+                    <rect x="63" y="18" width="4" height="24" fill="#4A5568" />
+                    <circle cx="110" cy="30" r="6" fill="#F6E05E" opacity="0.85">
+                        <animate attributeName="opacity" values="0.6;0.95;0.6" dur="4s" repeatCount="indefinite" />
+                    </circle>
+                    <path d="M15 50 Q35 45 55 50 T95 50 T135 50" stroke="#90CDF4" stroke-width="3" fill="none" stroke-linecap="round">
+                        <animate attributeName="d" dur="6s" repeatCount="indefinite"
+                            values="M15 50 Q35 45 55 50 T95 50 T135 50;
+                                   M15 50 Q35 47 55 50 T95 53 T135 50;
+                                   M15 50 Q35 45 55 50 T95 50 T135 50" />
+                    </path>
+                </svg>
+            </div>
+            <div class="island">
+                <svg width="170" height="80" viewBox="0 0 170 80" xmlns="http://www.w3.org/2000/svg">
+                    <defs>
+                        <linearGradient id="islandSand" x1="0%" y1="0%" x2="0%" y2="100%">
+                            <stop offset="0%" stop-color="#FCD9A5" />
+                            <stop offset="100%" stop-color="#F6AD55" />
+                        </linearGradient>
+                        <linearGradient id="islandGrass" x1="0%" y1="0%" x2="0%" y2="100%">
+                            <stop offset="0%" stop-color="#48BB78" />
+                            <stop offset="100%" stop-color="#2F855A" />
+                        </linearGradient>
+                    </defs>
+                    <ellipse cx="85" cy="62" rx="75" ry="14" fill="#63B3ED" opacity="0.45" />
+                    <path d="M25 55 C55 35 115 35 145 55" fill="url(#islandSand)" />
+                    <path d="M35 53 C60 38 110 38 135 53" fill="url(#islandGrass)" />
+                    <g>
+                        <rect x="78" y="12" width="8" height="32" fill="#744210" rx="2" />
+                        <path d="M82 10 C68 4 60 2 48 7 C65 12 70 17 72 24" fill="#48BB78" />
+                        <path d="M82 10 C96 2 105 0 118 6 C102 11 97 17 95 24" fill="#38A169" />
+                        <circle cx="54" cy="42" r="5" fill="#68D391" />
+                        <circle cx="110" cy="40" r="6" fill="#34D399" />
+                    </g>
+                    <g>
+                        <circle cx="64" cy="50" r="3.2" fill="#F687B3" />
+                        <circle cx="68" cy="48" r="2.4" fill="#ED64A6" />
+                        <circle cx="118" cy="49" r="3" fill="#F6ADCD" />
+                        <circle cx="122" cy="47" r="2.2" fill="#ED64A6" />
+                    </g>
+                </svg>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.title("Onboarding command deck")
+    st.caption("Chart your contacts, handovers, and workflows for a smooth landing.")
 
     init_db()
 
-    tab_add, tab_review, tab_workflow = st.tabs(
-        ["Add topic", "Review & update", "Workflow builder"]
+    (
+        tab_contacts,
+        tab_add,
+        tab_review,
+        tab_workflow,
+        tab_stakeholders,
+        tab_backups,
+    ) = st.tabs(
+        [
+            "Contacts",
+            "Add topic",
+            "Review & update",
+            "Workflow builder",
+            "Stakeholders",
+            "Backups",
+        ]
     )
+
+    ship_positions_js = json.dumps(ship_positions)
+    st.markdown(
+        f"""
+        <script>
+        const shipPositions = {ship_positions_js};
+        function updateShipPosition() {{
+            const externalDoc = window.parent?.document ?? document;
+            const tabs = externalDoc.querySelectorAll('button[data-baseweb="tab"]');
+            tabs.forEach(tab => {{
+                if (tab.getAttribute('aria-selected') === 'true') {{
+                    const label = tab.textContent.trim();
+                    const offset = shipPositions[label] ?? -15;
+                    externalDoc.documentElement.style.setProperty('--ship-pos', offset + '%');
+                }}
+            }});
+        }}
+        const externalDoc = window.parent?.document ?? document;
+        if (externalDoc.readyState === 'loading') {{
+            externalDoc.addEventListener('DOMContentLoaded', () => setTimeout(updateShipPosition, 150));
+        }} else {{
+            setTimeout(updateShipPosition, 150);
+        }}
+        externalDoc.addEventListener('click', evt => {{
+            if (evt.target.closest('button[data-baseweb="tab"]')) {{
+                setTimeout(updateShipPosition, 160);
+            }}
+        }});
+        setInterval(updateShipPosition, 2000);
+        </script>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with tab_contacts:
+        render_contacts()
 
     with tab_add:
         render_add_topic()
@@ -1436,6 +2821,12 @@ def main() -> None:
 
     with tab_workflow:
         render_workflows()
+
+    with tab_stakeholders:
+        render_stakeholders()
+
+    with tab_backups:
+        render_backups()
 
 
 if __name__ == "__main__":
