@@ -405,14 +405,6 @@ def _ensure_workflow_step_branch_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE workflow_steps ADD COLUMN no_step_id INTEGER")
 
 
-def _ensure_topic_photo_column(conn: sqlite3.Connection) -> None:
-    existing_columns = {
-        row[1] for row in conn.execute("PRAGMA table_info('handover_topics')")
-    }
-    if "photo" not in existing_columns:
-        conn.execute("ALTER TABLE handover_topics ADD COLUMN photo BLOB")
-
-
 def ensure_topic_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -425,12 +417,10 @@ def ensure_topic_schema(conn: sqlite3.Connection) -> None:
             status TEXT NOT NULL,
             next_steps TEXT,
             created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            photo BLOB
+            updated_at TEXT NOT NULL
         )
         """
     )
-    _ensure_topic_photo_column(conn)
 
 
 def ensure_stakeholder_schema(conn: sqlite3.Connection) -> None:
@@ -730,7 +720,7 @@ def clear_cached_contacts() -> None:
 def build_excel_report(df: pd.DataFrame) -> bytes:
     """Generate an Excel workbook with handover data."""
 
-    export_df = df.drop(columns=["photo"], errors="ignore").copy()
+    export_df = df.copy()
     export_df["Meeting Date"] = export_df["meeting_date"].apply(lambda d: d.strftime("%d %b %Y"))
     export_df["Status"] = export_df["status"].apply(status_badge)
     export_df["Created"] = export_df["created_at"].dt.strftime("%d %b %Y %H:%M")
@@ -791,11 +781,9 @@ def build_summary(df: pd.DataFrame) -> str:
     upcoming_window = dt.date.today() + dt.timedelta(days=7)
     upcoming = int((df["meeting_date"] <= upcoming_window).sum())
 
-    summary_source = df.drop(columns=["photo"], errors="ignore")
-
     summary_lines = [
         "# Handover summary",
-        f"- Total topics: {len(summary_source)}",
+        f"- Total topics: {len(df)}",
         f"- Completed: {completed}",
         f"- In progress: {in_progress}",
         f"- Waiting on others: {waiting}",
@@ -863,7 +851,6 @@ def add_topic(
     details: str,
     status: str,
     next_steps: str,
-    photo: Optional[bytes] = None,
 ) -> None:
     now_iso = dt.datetime.utcnow().isoformat(timespec="seconds")
     payload = (
@@ -875,7 +862,6 @@ def add_topic(
         next_steps.strip(),
         now_iso,
         now_iso,
-        photo,
     )
 
     with get_connection() as conn:
@@ -883,8 +869,8 @@ def add_topic(
         conn.execute(
             """
             INSERT INTO handover_topics (
-                person, topic, meeting_date, details, status, next_steps, created_at, updated_at, photo
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                person, topic, meeting_date, details, status, next_steps, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             payload,
         )
@@ -919,7 +905,10 @@ def update_topic(
 
 
 def fetch_topics(filters: Optional[Dict[str, Iterable[str]]] = None) -> pd.DataFrame:
-    query = "SELECT * FROM handover_topics"
+    query = (
+        "SELECT id, person, topic, meeting_date, details, status, next_steps, created_at, updated_at "
+        "FROM handover_topics"
+    )
     conditions: list[str] = []
     params: list[str] = []
 
@@ -1614,30 +1603,12 @@ def render_add_topic() -> None:
             "Next steps / notes",
             placeholder="Follow-up tasks, documents to share, risks, etc.",
         )
-        photo_capture = st.camera_input(
-            "Capture photo (optional)",
-            key="add_topic_camera",
-            help="Use your webcam to snap a quick reference photo.",
-        )
-        photo_upload = st.file_uploader(
-            "Or upload an image",
-            type=["png", "jpg", "jpeg"],
-            accept_multiple_files=False,
-            key="add_topic_photo_upload",
-        )
-
         submitted = st.form_submit_button("Save topic", type="primary")
         if submitted:
             if not person.strip() or not topic.strip():
                 st.error("Person and topic are required.")
             else:
-                photo_bytes: Optional[bytes] = None
-                if photo_capture is not None:
-                    photo_bytes = photo_capture.getvalue()
-                elif photo_upload is not None:
-                    photo_bytes = photo_upload.getvalue()
-
-                add_topic(person, topic, meeting_date, details, status, next_steps, photo=photo_bytes)
+                add_topic(person, topic, meeting_date, details, status, next_steps)
                 clear_cached_topics()
                 st.success("Topic saved and ready for review.")
                 st.experimental_rerun()
@@ -2070,7 +2041,7 @@ def render_review() -> None:
         )
 
     df = load_topics({"person": selected_persons, "status": selected_statuses})
-    df_display = df.drop(columns=["photo"], errors="ignore")
+    df_display = df
 
     if df.empty:
         st.info("No topics logged yet. Use the form above to add your first entry.")
@@ -2209,8 +2180,6 @@ def render_review() -> None:
         st.warning("Topic not found; it may have been removed.")
         return
 
-    existing_photo = selected_topic.get("photo") if isinstance(selected_topic, pd.Series) else None
-
     with st.form("update_topic_form"):
         new_person = st.text_input("Person responsible", value=selected_topic.person)
         new_topic = st.text_input("Topic", value=selected_topic.topic)
@@ -2230,36 +2199,6 @@ def render_review() -> None:
         new_details = st.text_area("Key details", value=selected_topic.details)
         new_next_steps = st.text_area("Next steps / notes", value=selected_topic.next_steps)
 
-        if existing_photo:
-            thumb_col, action_col = st.columns([1, 2])
-            with thumb_col:
-                st.image(
-                    io.BytesIO(existing_photo),
-                    caption="Current photo",
-                    width=120,
-                )
-            with action_col:
-                with st.popover("View full photo"):
-                    st.image(io.BytesIO(existing_photo), use_container_width=True)
-        photo_capture_update = st.camera_input(
-            "Update photo (optional)",
-            key=f"update_topic_camera_{topic_id}",
-            help="Capture a replacement photo for this record.",
-        )
-        photo_upload_update = st.file_uploader(
-            "Or upload a new image",
-            type=["png", "jpg", "jpeg"],
-            accept_multiple_files=False,
-            key=f"update_topic_photo_upload_{topic_id}",
-        )
-        remove_photo = False
-        if existing_photo is not None:
-            remove_photo = st.checkbox(
-                "Remove existing photo",
-                value=False,
-                help="Clear the stored image for this topic.",
-            )
-
         submitted = st.form_submit_button("Apply changes", type="primary")
 
     if submitted:
@@ -2270,21 +2209,6 @@ def render_review() -> None:
             "status": new_status,
             "next_steps": new_next_steps.strip(),
         }
-        photo_updated = False
-        photo_bytes: Optional[bytes] = None
-        if remove_photo:
-            photo_updated = True
-            photo_bytes = None
-        elif photo_capture_update is not None:
-            photo_updated = True
-            photo_bytes = photo_capture_update.getvalue()
-        elif photo_upload_update is not None:
-            photo_updated = True
-            photo_bytes = photo_upload_update.getvalue()
-
-        if photo_updated:
-            updates["photo"] = photo_bytes
-
         update_topic(topic_id, updates, meeting_date=new_meeting_date)
         clear_cached_topics()
         st.success("Topic updated.")
