@@ -6,7 +6,7 @@ import json
 import shutil
 import sqlite3
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
 from urllib.parse import quote
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
@@ -67,6 +67,15 @@ STATUS_COLORS = {
     "Archived": "#7f7f7f",
 }
 
+ORG_LEVEL_COLORS = [
+    "#FEE4E2",  # Level 0
+    "#FEF3C7",  # Level 1
+    "#DCFCE7",  # Level 2
+    "#BFDBFE",  # Level 3
+    "#E9D5FF",  # Level 4
+    "#FBCFE8",  # Level 5+
+]
+
 try:
     from barfi.flow import Block
     from barfi.flow.streamlit import st_flow
@@ -109,6 +118,12 @@ def _wrap_title(title: str, max_chars: int = 40) -> str:
         lines.append(" ".join(current))
 
     return "\n".join(lines)
+
+
+def _org_level_color(level: int) -> str:
+    if not ORG_LEVEL_COLORS:
+        return "#EDF2F7"
+    return ORG_LEVEL_COLORS[min(level, len(ORG_LEVEL_COLORS) - 1)]
 
 
 def _estimate_node_width(text: str, min_width: float = 3.0, char_width: float = 0.22) -> float:
@@ -1611,7 +1626,7 @@ def render_add_topic() -> None:
                 add_topic(person, topic, meeting_date, details, status, next_steps)
                 clear_cached_topics()
                 st.success("Topic saved and ready for review.")
-                st.experimental_rerun()
+                _trigger_rerun()
 
 
 def _contact_select_options(df: pd.DataFrame) -> Dict[str, int]:
@@ -1676,6 +1691,32 @@ def build_contacts_org_graph(
     if not display_ids:
         return None
 
+    parent_lookup: Dict[int, Optional[int]] = {}
+    children_map: Dict[int, List[int]] = defaultdict(list)
+
+    for contact_id in display_ids:
+        row = id_to_row.get(contact_id)
+        if row is None:
+            continue
+        manager_id = _safe_int(row.get("manager_id"))
+        parent_lookup[contact_id] = manager_id if manager_id in display_ids else None
+        if manager_id is not None and manager_id in display_ids:
+            children_map[manager_id].append(contact_id)
+
+    roots = [cid for cid in display_ids if parent_lookup.get(cid) is None]
+    if not roots:
+        roots = sorted(display_ids)
+
+    levels: Dict[int, int] = {}
+    bfs_queue: deque[Tuple[int, int]] = deque((root, 0) for root in roots)
+    while bfs_queue:
+        contact_id, level = bfs_queue.popleft()
+        if contact_id in levels:
+            continue
+        levels[contact_id] = level
+        for child_id in children_map.get(contact_id, []):
+            bfs_queue.append((child_id, level + 1))
+
     graph_lines = [
         "digraph OrgStructure {",
         "    rankdir=TB;",
@@ -1696,10 +1737,13 @@ def build_contacts_org_graph(
         if title:
             label_parts.append(title.strip())
         label = "\n".join(label_parts).replace("\n\n", "\n")
-        fill = "#E9D8FD" if contact_id in filtered_ids else "#EDF2F7"
+        level = levels.get(contact_id, 0)
+        fill = _org_level_color(level)
+        border_color = "#6B46C1" if contact_id in filtered_ids else "#2D3748"
+        penwidth = 3 if contact_id in filtered_ids else 1.8
         safe_label = label.replace("\"", "\\\"")
         graph_lines.append(
-            f'    "node_{contact_id}" [label="{safe_label}", fillcolor="{fill}"];'
+            f'    "node_{contact_id}" [label="{safe_label}", fillcolor="{fill}", color="{border_color}", penwidth={penwidth}];'
         )
 
     for contact_id in display_ids:
@@ -1823,22 +1867,43 @@ def render_contacts() -> None:
     display_df["manager_name"] = display_df["manager_id"].map(manager_lookup)
     display_df["created_at"] = display_df["created_at"].dt.strftime("%d %b %Y %H:%M")
     display_df["updated_at"] = display_df["updated_at"].dt.strftime("%d %b %Y %H:%M")
-    st.dataframe(
-        display_df[
-            [
-                "full_name",
-                "title",
-                "department",
-                "email",
-                "phone",
-                "location",
-                "manager_name",
-                "notes",
-                "updated_at",
-            ]
-        ],
+    selected_ids: List[int] = []
+    st.caption("Toggle the checkbox to mark contacts for bulk removal before clicking delete.")
+    table_payload = display_df[
+        [
+            "id",
+            "full_name",
+            "title",
+            "department",
+            "email",
+            "phone",
+            "location",
+            "manager_name",
+            "notes",
+            "updated_at",
+        ]
+    ].copy()
+    table_payload.insert(0, "Selected", False)
+    edited_table = st.data_editor(
+        table_payload,
+        hide_index=True,
         use_container_width=True,
+        disabled=[
+            "id",
+            "full_name",
+            "title",
+            "department",
+            "email",
+            "phone",
+            "location",
+            "manager_name",
+            "notes",
+            "updated_at",
+        ],
+        key="contacts_directory_editor",
     )
+    if not edited_table.empty:
+        selected_ids = edited_table.loc[edited_table["Selected"] == True, "id"].tolist()  # noqa: E712
 
     csv = display_df.to_csv(index=False)
     st.download_button(
@@ -1925,12 +1990,19 @@ def render_contacts() -> None:
             update_contact(contact_id, update_payload)
             clear_cached_contacts()
             st.success("Contact updated.")
+            _trigger_rerun()
 
-    if st.button("🗑️ Remove selected contacts", type="secondary"):
+    remove_disabled = not selected_ids
+    if st.button(
+        "🗑️ Remove selected contacts",
+        type="secondary",
+        disabled=remove_disabled,
+        help="Select at least one row above before deleting.",
+    ):
         delete_contacts(selected_ids)
         clear_cached_contacts()
         st.success("Selected contacts removed.")
-        st.experimental_rerun()
+        _trigger_rerun()
 
 
 def render_backups() -> None:
@@ -2747,7 +2819,11 @@ def main() -> None:
         render_workflows()
 
     with tab_stakeholders:
-        render_stakeholders()
+        password = st.text_input("Enter password to view Stakeholders", type="password")
+        if password == "20sara29":
+            render_stakeholders()
+        else:
+            st.markdown(":)")
 
     with tab_backups:
         render_backups()
@@ -2755,4 +2831,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
