@@ -301,16 +301,22 @@ def build_graphviz_workflow(
     steps_df: pd.DataFrame,
     font_size: int = 26,
     current_step_id: Optional[int] = None,
+    compact: bool = False,
 ) -> Optional[str]:
     if steps_df.empty:
         return None
 
     ordered = steps_df.sort_values("step_order")
-    node_font = max(12, font_size)
+    graph_nodesep = 0.35 if compact else 0.8
+    graph_ranksep = 0.65 if compact else 1.2
+    graph_margin = '"0.15,0.15"' if compact else '"0.3,0.3"'
+    node_font = max(10, font_size - 6) if compact else max(12, font_size)
+    node_width = 1.8 if compact else 3.0
+    line_height = 0.7 if compact else 0.9
     lines: List[str] = [
         "digraph Workflow {",
         "    rankdir=LR;",
-        '    graph [splines=ortho, nodesep=0.8, ranksep=1.2, margin="0.3,0.3"];',
+        f'    graph [splines=ortho, nodesep={graph_nodesep}, ranksep={graph_ranksep}, margin={graph_margin}];',
         f'    node [shape=rectangle, style="rounded,filled", fontname="Helvetica", fontsize={node_font}, fillcolor="#F7FAFC", color="#4A5568", fontcolor="#1A202C", fixedsize=false];',
         '    edge [fontname="Helvetica", fontsize=22, color="#4A5568"];',
     ]
@@ -364,8 +370,8 @@ def build_graphviz_workflow(
             f"fontsize={node_font}",
             f"fillcolor=\"{step_color}\"",
             "style=\"rounded,filled\"",
-            "lineheight=0.9",
-            "width=3.0",
+            f"lineheight={line_height}",
+            f"width={node_width}",
         ]
         if highlight:
             node_attrs.extend(
@@ -385,7 +391,8 @@ def build_graphviz_workflow(
         if first_step_id is None:
             first_step_id = step_id
 
-        row_index = node_count // 4
+        row_group_size = 6 if compact else 4
+        row_index = node_count // row_group_size
         row_chunks.setdefault(row_index, []).append(node_name)
         node_count += 1
 
@@ -1441,11 +1448,17 @@ def delete_workflow_process(workflow_id: int) -> None:
             init_db()
 
 
-def render_workflow_diagram(steps_df: pd.DataFrame, font_size: int, current_step_id: Optional[int]) -> None:
+def render_workflow_diagram(
+    steps_df: pd.DataFrame,
+    font_size: int,
+    current_step_id: Optional[int],
+    compact: bool = False,
+) -> None:
     graphviz_code = build_graphviz_workflow(
         steps_df,
         font_size=font_size,
         current_step_id=current_step_id,
+        compact=compact,
     )
     if graphviz_code:
         st.graphviz_chart(graphviz_code, use_container_width=True)
@@ -1520,14 +1533,17 @@ def render_workflows() -> None:
             st.info("No workflows available to delete.")
 
     if "workflow_font_size" not in st.session_state:
-        st.session_state["workflow_font_size"] = 26
+        st.session_state["workflow_font_size"] = 12
     if "workflow_font_input" not in st.session_state:
         st.session_state["workflow_font_input"] = str(st.session_state["workflow_font_size"])
     if st.session_state.pop("workflow_font_reset_pending", False):
-        st.session_state["workflow_font_size"] = 26
-        st.session_state["workflow_font_input"] = "26"
+        st.session_state["workflow_font_size"] = 12
+        st.session_state["workflow_font_input"] = "12"
 
-    font_col, reset_col = st.columns([3, 1])
+    if "workflow_compact_layout" not in st.session_state:
+        st.session_state["workflow_compact_layout"] = False
+
+    font_col, reset_col, compact_col = st.columns([3, 1, 1])
     with font_col:
         st.caption("Workflow diagram font size (12–60 pt)")
         font_input = st.text_input(
@@ -1557,7 +1573,16 @@ def render_workflows() -> None:
             st.session_state["workflow_font_reset_pending"] = True
             _trigger_rerun()
 
+    with compact_col:
+        st.checkbox(
+            "Compact layout",
+            value=st.session_state["workflow_compact_layout"],
+            key="workflow_compact_layout",
+            help="Tighter spacing, smaller nodes for dense workflows.",
+        )
+
     font_size = st.session_state["workflow_font_size"]
+    compact_layout = st.session_state["workflow_compact_layout"]
 
     grouped = df.groupby("workflow_id", sort=False)
     for workflow_id, group in grouped:
@@ -1587,50 +1612,15 @@ def render_workflows() -> None:
             ])
 
             with tab_visual:
-                state_key_current = f"workflow_current_step_{workflow_id}"
-                state_key_source = f"workflow_current_source_{workflow_id}"
-                if state_key_current not in st.session_state:
-                    st.session_state[state_key_current] = None
-                if state_key_source not in st.session_state:
-                    st.session_state[state_key_source] = "diagram"
-
-                current_step_id = st.session_state[state_key_current]
-
-                ordered_steps = steps_df.sort_values("step_order") if not steps_df.empty else pd.DataFrame()
-                step_options = (
-                    ordered_steps["step_id"].dropna().astype(int).tolist()
-                    if not ordered_steps.empty
-                    else []
-                )
-
-                if step_options:
-                    display_options = {
-                        int(step_id): f"Step {int(step_order)}"
-                        for step_id, step_order in zip(
-                            ordered_steps["step_id"],
-                            ordered_steps["step_order"],
-                        )
-                    }
-                    selected_option = st.selectbox(
-                        "Highlight step",
-                        options=[None] + step_options,
-                        index=(step_options.index(current_step_id) + 1) if current_step_id in step_options else 0,
-                        format_func=lambda opt: "— None —" if opt is None else display_options.get(int(opt), str(opt)),
-                        key=f"workflow_step_select_{workflow_id}",
-                    )
-                    st.session_state[state_key_current] = selected_option
-                    st.session_state[state_key_source] = "selectbox"
-                elif steps_df.empty:
-                    st.caption("Add steps to enable highlighting.")
-
+                current_step_id = None
                 if steps_df.empty:
-                    st.info("No steps logged for this workflow yet. Use the table below to add steps.")
-                else:
-                    render_workflow_diagram(
-                        steps_df,
-                        font_size=font_size,
-                        current_step_id=current_step_id,
-                    )
+                    st.caption("Add steps to populate the visualization.")
+                render_workflow_diagram(
+                    steps_df,
+                    font_size=font_size,
+                    current_step_id=current_step_id,
+                    compact=compact_layout,
+                )
 
                 base_columns = ["step_id", "step_order", "step_title", "yes_step_id", "no_step_id", "step_color"]
                 if "step_start_date" in steps_df.columns:
