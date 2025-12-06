@@ -1731,6 +1731,36 @@ def render_workflows() -> None:
                             updates: Dict[int, Dict[str, object]] = {}
                             inserts: List[Dict[str, object]] = []
 
+                            def _normalize_step_ref(raw_value: object, label: str) -> Optional[int]:
+                                if raw_value is None:
+                                    return None
+                                if isinstance(raw_value, str):
+                                    raw_value = raw_value.strip()
+                                    if not raw_value:
+                                        return None
+                                if isinstance(raw_value, (list, tuple, set)):
+                                    normalized = [item for item in list(raw_value) if item not in (None, "")]
+                                    if not normalized:
+                                        return None
+                                    if len(normalized) > 1:
+                                        raise ValueError(f"{label} must contain a single number.")
+                                    raw_value = normalized[0]
+                                if isinstance(raw_value, dict):
+                                    raise ValueError(f"{label} must contain a single number.")
+                                try:
+                                    if pd.isna(raw_value):
+                                        return None
+                                except TypeError:
+                                    # Some objects (e.g., custom classes) may not support isna checks.
+                                    pass
+                                try:
+                                    value = int(raw_value)
+                                except (TypeError, ValueError):
+                                    raise ValueError(f"{label} must be a whole number or left blank.")
+                                if value <= 0:
+                                    raise ValueError(f"{label} must be a positive integer.")
+                                return value
+
                             for row in editor_df.itertuples(index=False):
                                 step_id = row.step_id
                                 title_raw = row.title
@@ -1744,8 +1774,8 @@ def render_workflows() -> None:
                                 yes_raw = row.yes_step_id
                                 no_raw = row.no_step_id
 
-                                yes_val = None if pd.isna(yes_raw) else int(yes_raw)
-                                no_val = None if pd.isna(no_raw) else int(no_raw)
+                                yes_val = _normalize_step_ref(yes_raw, "Yes → Step ID")
+                                no_val = _normalize_step_ref(no_raw, "No → Step ID")
                                 for value, label in ((yes_val, "Yes"), (no_val, "No")):
                                     if value is not None and value not in valid_step_ids:
                                         raise ValueError(
