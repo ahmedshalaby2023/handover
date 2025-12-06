@@ -162,6 +162,13 @@ ORG_LEVEL_COLORS = [
     "#FBCFE8",  # Level 5+
 ]
 
+DEFAULT_STEP_COLOR = "#FEF3C7"  # Yellow by default
+STEP_COLOR_CHOICES = [
+    "#FEE2E2",  # Red
+    "#FEF3C7",  # Yellow
+    "#DCFCE7",  # Green
+]
+
 try:
     from barfi.flow import Block
     from barfi.flow.streamlit import st_flow
@@ -174,10 +181,10 @@ except ImportError:  # pragma: no cover - optional dependency
 
 
 def _graphviz_label(text: str) -> str:
-    return text.replace("\\", "\\\\").replace("\n", "\\n").replace("\"", "\\\"")
+    return text.replace("\\", "\\\\").replace("\"", "\\\"")
 
 
-def _wrap_title(title: str, max_chars: int = 40) -> str:
+def _wrap_title(title: str, max_chars: int = 25) -> str:
     clean = title.strip()
     if len(clean) <= max_chars:
         return clean
@@ -210,6 +217,14 @@ def _org_level_color(level: int) -> str:
     if not ORG_LEVEL_COLORS:
         return "#EDF2F7"
     return ORG_LEVEL_COLORS[min(level, len(ORG_LEVEL_COLORS) - 1)]
+
+
+def _sanitize_hex_color(value: Optional[str], fallback: str = DEFAULT_STEP_COLOR) -> str:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("#") and len(stripped) in (4, 7):
+            return stripped
+    return fallback
 
 
 def _estimate_node_width(text: str, min_width: float = 3.0, char_width: float = 0.22) -> float:
@@ -295,16 +310,16 @@ def build_graphviz_workflow(
     lines: List[str] = [
         "digraph Workflow {",
         "    rankdir=LR;",
-        '    graph [splines=ortho, nodesep=0.4, ranksep=0.75, margin="0.25,0.25"];',
+        '    graph [splines=ortho, nodesep=0.8, ranksep=1.2, margin="0.3,0.3"];',
         f'    node [shape=rectangle, style="rounded,filled", fontname="Helvetica", fontsize={node_font}, fillcolor="#F7FAFC", color="#4A5568", fontcolor="#1A202C", fixedsize=false];',
         '    edge [fontname="Helvetica", fontsize=22, color="#4A5568"];',
     ]
 
     lines.append(
-        f'    start [label="Start", shape=circle, style="filled", fillcolor="#C1E1C1", color="#2F855A", fontcolor="#1A202C", fontsize={node_font}];'
+        f'    start [label="Start", shape=circle, style="filled", fillcolor="#C1E1C1", color="#2F855A", fontcolor="#1A202C", fontsize={node_font}, width="0.3", height="0.3", fixedsize=true];'
     )
     lines.append(
-        f'    finish [label="Finish", shape=doublecircle, style="filled", fillcolor="#C1E1C1", color="#2F855A", fontcolor="#1A202C", fontsize={node_font}];'
+        f'    finish [label="Finish", shape=doublecircle, style="filled", fillcolor="#C1E1C1", color="#2F855A", fontcolor="#1A202C", fontsize={node_font}, width="0.3", height="0.3", fixedsize=true];'
     )
 
     def node_id(step_id: int) -> str:
@@ -325,23 +340,36 @@ def build_graphviz_workflow(
         step_id = int(row.step_id)
         node_name = node_id(step_id)
         wrapped_title = _wrap_title(row.step_title.strip())
-        title = f"Step {int(row.step_order)}: {wrapped_title}"
-        label = _graphviz_label(title)
+        label_lines = [
+            f"Step {int(row.step_order)}:",
+            wrapped_title,
+        ]
+
+        if hasattr(row, "step_start_date") and pd.notna(row.step_start_date):
+            label_lines.append(f"S: {row.step_start_date.strftime('%d/%m/%Y')}")
+        if hasattr(row, "step_finish_date") and pd.notna(row.step_finish_date):
+            label_lines.append(f"F: {row.step_finish_date.strftime('%d/%m/%Y')}")
+
+        label = _graphviz_label("\n".join(label_lines))
         is_decision = bool(getattr(row, "no_step_id", None) and not pd.isna(row.no_step_id))
         shape = "diamond" if is_decision else "rectangle"
         border_color = "#4A5568"
         highlight = current_step_id is not None and step_id == current_step_id
+        step_color = _sanitize_hex_color(getattr(row, "step_color", None))
         node_attrs = [
             f"label=\"{label}\"",
             f"shape={shape}",
             f"color=\"{border_color}\"",
             "penwidth=2",
             f"fontsize={node_font}",
+            f"fillcolor=\"{step_color}\"",
+            "style=\"rounded,filled\"",
+            "lineheight=0.9",
+            "width=3.0",
         ]
         if highlight:
             node_attrs.extend(
                 [
-                    "style=\"rounded,filled\"",
                     "fillcolor=\"#FFF3BF\"",
                     "color=\"#F59E0B\"",
                     "penwidth=3",
@@ -477,6 +505,9 @@ def ensure_workflow_tables(conn: sqlite3.Connection) -> None:
             step_order INTEGER NOT NULL,
             title TEXT NOT NULL,
             status TEXT NOT NULL,
+            color TEXT,
+            start_date TEXT,
+            finish_date TEXT,
             yes_step_id INTEGER,
             no_step_id INTEGER,
             created_at TEXT NOT NULL,
@@ -493,6 +524,9 @@ def ensure_workflow_tables(conn: sqlite3.Connection) -> None:
         """
     )
     _ensure_workflow_step_branch_columns(conn)
+    _ensure_workflow_step_color_column(conn)
+    _ensure_workflow_step_start_date_column(conn)
+    _ensure_workflow_step_finish_date_column(conn)
     conn.commit()
 
 
@@ -504,6 +538,30 @@ def _ensure_workflow_step_branch_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE workflow_steps ADD COLUMN yes_step_id INTEGER")
     if "no_step_id" not in existing_columns:
         conn.execute("ALTER TABLE workflow_steps ADD COLUMN no_step_id INTEGER")
+
+
+def _ensure_workflow_step_color_column(conn: sqlite3.Connection) -> None:
+    existing_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info('workflow_steps')")
+    }
+    if "color" not in existing_columns:
+        conn.execute("ALTER TABLE workflow_steps ADD COLUMN color TEXT")
+
+
+def _ensure_workflow_step_start_date_column(conn: sqlite3.Connection) -> None:
+    existing_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info('workflow_steps')")
+    }
+    if "start_date" not in existing_columns:
+        conn.execute("ALTER TABLE workflow_steps ADD COLUMN start_date TEXT")
+
+
+def _ensure_workflow_step_finish_date_column(conn: sqlite3.Connection) -> None:
+    existing_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info('workflow_steps')")
+    }
+    if "finish_date" not in existing_columns:
+        conn.execute("ALTER TABLE workflow_steps ADD COLUMN finish_date TEXT")
 
 
 def ensure_topic_schema(conn: sqlite3.Connection) -> None:
@@ -1083,14 +1141,17 @@ def add_workflow_process(name: str, owner: str, description: str, steps: List[st
                     step_cursor = conn.execute(
                         """
                         INSERT INTO workflow_steps (
-                            workflow_id, step_order, title, status, yes_step_id, no_step_id, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            workflow_id, step_order, title, status, color, start_date, finish_date, yes_step_id, no_step_id, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             workflow_id,
                             order,
                             title.strip(),
                             "Not Started",
+                            DEFAULT_STEP_COLOR,
+                            None,
+                            None,
                             None,
                             None,
                             now_iso,
@@ -1125,6 +1186,9 @@ def fetch_workflows() -> pd.DataFrame:
             s.step_order,
             s.title AS step_title,
             s.status AS step_status,
+            s.color AS step_color,
+            s.start_date AS step_start_date,
+            s.finish_date AS step_finish_date,
             s.yes_step_id,
             s.no_step_id,
             s.updated_at AS step_updated_at
@@ -1149,6 +1213,9 @@ def fetch_workflows() -> pd.DataFrame:
                     "step_order",
                     "step_title",
                     "step_status",
+                    "step_color",
+                    "step_start_date",
+                    "step_finish_date",
                     "yes_step_id",
                     "no_step_id",
                     "step_updated_at",
@@ -1160,6 +1227,12 @@ def fetch_workflows() -> pd.DataFrame:
         df["workflow_created_at"] = pd.to_datetime(df["workflow_created_at"])
         if "step_updated_at" in df.columns:
             df["step_updated_at"] = pd.to_datetime(df["step_updated_at"])
+        if "step_color" in df.columns:
+            df["step_color"] = df["step_color"].apply(_sanitize_hex_color)
+        if "step_start_date" in df.columns:
+            df["step_start_date"] = pd.to_datetime(df["step_start_date"], errors="coerce").dt.date
+        if "step_finish_date" in df.columns:
+            df["step_finish_date"] = pd.to_datetime(df["step_finish_date"], errors="coerce").dt.date
 
     return df
 
@@ -1249,12 +1322,17 @@ def update_workflow_steps(step_updates: Dict[int, Dict[str, object]]) -> None:
                     columns: List[str] = []
                     values: List[object] = []
 
-                    for column in ("title", "step_order", "yes_step_id", "no_step_id"):
+                    for column in ("title", "step_order", "yes_step_id", "no_step_id", "color", "start_date", "finish_date"):
                         if column in fields:
-                            if column == "title" and isinstance(fields[column], str):
-                                values.append(fields[column].strip())
+                            value = fields[column]
+                            if column == "title" and isinstance(value, str):
+                                values.append(value.strip())
+                            elif column == "color":
+                                values.append(_sanitize_hex_color(value))
+                            elif column in ("start_date", "finish_date") and isinstance(value, (dt.date, dt.datetime)):
+                                values.append(value.isoformat() if isinstance(value, dt.datetime) else value.isoformat())
                             else:
-                                values.append(fields[column])
+                                values.append(value)
                             columns.append(f"{column} = ?")
 
                     if not columns:
@@ -1281,14 +1359,23 @@ def insert_workflow_step(
     title: str,
     yes_step_id: Optional[int],
     no_step_id: Optional[int],
+    color: Optional[str] = None,
+    start_date: Optional[dt.date] = None,
+    finish_date: Optional[dt.date] = None,
 ) -> int:
     init_db()
     now_iso = dt.datetime.utcnow().isoformat(timespec="seconds")
+    step_color = _sanitize_hex_color(color)
+    start_date_iso = start_date.isoformat() if isinstance(start_date, dt.date) else None
+    finish_date_iso = finish_date.isoformat() if isinstance(finish_date, dt.date) else None
     payload = (
         int(workflow_id),
         int(step_order),
         title.strip(),
         "Not Started",
+        step_color,
+        start_date_iso,
+        finish_date_iso,
         yes_step_id,
         no_step_id,
         now_iso,
@@ -1302,8 +1389,8 @@ def insert_workflow_step(
                 cursor = conn.execute(
                     """
                     INSERT INTO workflow_steps (
-                        workflow_id, step_order, title, status, yes_step_id, no_step_id, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        workflow_id, step_order, title, status, color, start_date, finish_date, yes_step_id, no_step_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     payload,
                 )
@@ -1545,24 +1632,36 @@ def render_workflows() -> None:
                         current_step_id=current_step_id,
                     )
 
-                base_columns = ["step_id", "step_order", "step_title", "yes_step_id", "no_step_id"]
+                base_columns = ["step_id", "step_order", "step_title", "yes_step_id", "no_step_id", "step_color"]
+                if "step_start_date" in steps_df.columns:
+                    base_columns.append("step_start_date")
+                if "step_finish_date" in steps_df.columns:
+                    base_columns.append("step_finish_date")
                 if steps_df.empty:
                     table_source = pd.DataFrame(columns=base_columns)
                 else:
                     table_source = steps_df[base_columns].copy()
 
-                table_source = table_source.rename(
-                    columns={
-                        "step_id": "step_id",
-                        "step_order": "step_order",
-                        "step_title": "title",
-                        "yes_step_id": "yes_step_id",
-                        "no_step_id": "no_step_id",
-                    }
-                )
+                rename_map = {
+                    "step_id": "step_id",
+                    "step_order": "step_order",
+                    "step_title": "title",
+                    "yes_step_id": "yes_step_id",
+                    "no_step_id": "no_step_id",
+                    "step_color": "color",
+                }
+                if "step_start_date" in steps_df.columns:
+                    rename_map["step_start_date"] = "start_date"
+                if "step_finish_date" in steps_df.columns:
+                    rename_map["step_finish_date"] = "finish_date"
+                table_source = table_source.rename(columns=rename_map)
 
                 if "step_id" in table_source.columns:
                     table_source["step_id"] = table_source["step_id"].astype("Int64")
+                if "color" not in table_source.columns:
+                    table_source["color"] = DEFAULT_STEP_COLOR
+                else:
+                    table_source["color"] = table_source["color"].apply(_sanitize_hex_color)
 
                 row_count = max(len(table_source), 1)
                 table_height = min(700, 60 * row_count + 120)
@@ -1579,28 +1678,40 @@ def render_workflows() -> None:
                         return "medium"
                     return "small"
 
+                column_config = {
+                    "step_id": st.column_config.NumberColumn("Step ID", disabled=True, width="small"),
+                    "step_order": st.column_config.NumberColumn(
+                        "Step order", min_value=1, width=_pick_width(step_len)
+                    ),
+                    "title": st.column_config.TextColumn("Title", width=_pick_width(title_len)),
+                    "yes_step_id": st.column_config.NumberColumn(
+                        "Yes → Step ID", min_value=1, required=False, width=_pick_width(yes_len)
+                    ),
+                    "no_step_id": st.column_config.NumberColumn(
+                        "No → Step ID", min_value=1, required=False, width=_pick_width(no_len)
+                    ),
+                    "color": st.column_config.SelectboxColumn(
+                        "Node color",
+                        options=STEP_COLOR_CHOICES,
+                        default=DEFAULT_STEP_COLOR,
+                        help="Pick one of the preset pastel fills for the diagram node.",
+                        width="small",
+                    ),
+                }
+                if "start_date" in table_source.columns:
+                    column_config["start_date"] = st.column_config.DateColumn("Start date", format="DD/MM/YYYY", width="medium")
+                if "finish_date" in table_source.columns:
+                    column_config["finish_date"] = st.column_config.DateColumn("Finish date", format="DD/MM/YYYY", width="medium")
+
                 editor_df = st.data_editor(
                     table_source,
                     num_rows="dynamic",
                     use_container_width=True,
                     height=table_height,
                     key=f"workflow_table_editor_{workflow_id}",
-                    column_config={
-                        "step_id": st.column_config.NumberColumn("Step ID", disabled=True, width="small"),
-                        "step_order": st.column_config.NumberColumn(
-                            "Step order", min_value=1, width=_pick_width(step_len)
-                        ),
-                        "title": st.column_config.TextColumn("Title", width=_pick_width(title_len)),
-                        "yes_step_id": st.column_config.NumberColumn(
-                            "Yes → Step ID", min_value=1, required=False, width=_pick_width(yes_len)
-                        ),
-                        "no_step_id": st.column_config.NumberColumn(
-                            "No → Step ID", min_value=1, required=False, width=_pick_width(no_len)
-                        ),
-                    },
+                    column_config=column_config,
                     hide_index=True,
                 )
-
                 if st.button("Save table changes", key=f"workflow_table_save_{workflow_id}"):
                     if editor_df.empty:
                         st.error("Add at least one step before saving.")
@@ -1646,7 +1757,12 @@ def render_workflows() -> None:
                                     "title": title_raw.strip(),
                                     "yes_step_id": yes_val,
                                     "no_step_id": no_val,
+                                    "color": _sanitize_hex_color(row.color),
                                 }
+                                if hasattr(row, 'start_date'):
+                                    payload["start_date"] = row.start_date
+                                if hasattr(row, 'finish_date'):
+                                    payload["finish_date"] = row.finish_date
 
                                 if pd.isna(step_id):
                                     inserts.append(payload)
@@ -1667,6 +1783,9 @@ def render_workflows() -> None:
                                     payload["title"],
                                     payload["yes_step_id"],
                                     payload["no_step_id"],
+                                    payload.get("color", DEFAULT_STEP_COLOR),
+                                    payload.get("start_date"),
+                                    payload.get("finish_date"),
                                 )
 
                             clear_cached_workflows()
